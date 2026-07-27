@@ -73,26 +73,63 @@ where touch only ever drives one dino.
 ## The rope
 
 A damped vertical spring between each neighbouring pair, applied *before* the
-ground clamp so a partner's tug can rip a grounded dino off the floor. Tuned
-against a measured response curve rather than by eye:
+ground clamp so a partner's weight can drag on a grounded dino.
 
-| desync between two jumps | apexes reached (a free jump is 188px) | |
-|---|---|---|
-| 0 ms | 196 / 196 | rope never engages |
-| 50 ms | 167 / 212 | slight tug, partner slingshotted |
-| 100 ms | 173 / 174 | still clears a large cactus |
-| **167 ms** | **83 / 77** | **cliff — neither clears a large cactus** |
-| solo jump | 83 / 77 | partner dragged 77px into the air |
+**The rope tethers players; it does not drive them.** Everyone plays their own
+run, reacting to what is in front of their own dino, and feels the others as
+weight. Failure is the shared part: one crash ends the run for everyone
+(`Simulation._check_collisions`), so the tension is social rather than
+mechanical.
 
-Past ~167ms the late player has already been yanked airborne, so their jump
-input is silently eaten — you cannot jump when you are not grounded. That is
-the punish. By ~500ms they have landed and can act again, which is what keeps
-it recoverable.
+### The retune, and why it was needed
 
-`MAX_STRETCH` is 40px, far below the 220 in the original design sketch, and it
-has to be: two dinos can never be more than one jump height apart (~196px), so
-a 220px limit is physically unreachable and the stiffening branch would be dead
-code.
+The original tuning (`K_ROPE=16`, `MAX_STRETCH=40`) contradicted the game's own
+geometry. Players stand `PLAYER_SPACING_X` apart, so the same cactus reaches
+them at different moments and they are **forced** out of sync:
+
+| speed | forced offset between jumps |
+|---|---|
+| `BASE_SPEED` (start) | **262 ms** |
+| 700 px/s (mid-run) | 157 ms |
+| `MAX_SPEED` | 100 ms |
+
+…while the rope's cliff sat at ~150 ms. Correct play was punished from the
+first obstacle. Two bots each playing their own game averaged **18 m** against
+**371 m** solo — the rope was eating 95% of the run.
+
+Retuned against that geometry (`K_ROPE=6`, `ROPE_DAMP=0.2`,
+`MAX_STRETCH=170`). Apexes reached when the second dino jumps late, against a
+196px free jump and an 82px large cactus:
+
+| desync | before | after | |
+|---|---|---|---|
+| 0 ms | 196 | 196 | in sync, rope never engages |
+| 157 ms | **77 ✗** | 164 | the forced offset at speed |
+| 262 ms | **77 ✗** | 156 | the forced offset at the start |
+| 500 ms | 83 | 156 | properly out of sync, still survivable |
+
+(✗ = clips a large cactus, i.e. an unavoidable death.)
+
+Two independent bots now average **365 m — 98% of solo**. The rope costs 2% of
+the run instead of 95%.
+
+### It is still a rope
+
+- **It holds you back.** Jumping while your partner is grounded costs 40px of
+  height — a fifth of your jump — clearly felt, never fatal.
+- **It slingshots.** The late jumper is pulled *up* by the partner's weight,
+  reaching 202–211px against a 196px free jump. Being second has an upside.
+- **It still runs out.** Pairs reach 194px apart against the 170px
+  `MAX_STRETCH`, so the stiffening branch is live at the top of the range.
+- **Shared fate is unchanged.** Any dino touching an obstacle ends the run for
+  everyone; a shield still absorbs one hit for the whole team.
+
+`MAX_STRETCH` is a UI number as much as a physics one — `rope_tension()`
+divides by it to drive the HUD meter and the screen shake. Setting it to the
+120 the physics alone would have liked pins the meter red 13% of the time and
+shakes the screen 67 times a minute. 170 keeps the meter meaningful (pinned
+1.1%) and the shake rare enough to mean something (16/min). Above ~196 the
+stiffening branch becomes unreachable and dies.
 
 ## Obstacles and power-ups
 

@@ -70,32 +70,59 @@ MAX_PLAYERS: Final[int] = 4
 # Elastic rope  (Phase 2 -- tuned there for feel)
 # ---------------------------------------------------------------------------
 
-# Tuned in Phase 2 against a measured response curve, not by eye. The shape we
-# want is "slack, then a wall": nearly silent when partners jump together, and
-# a hard yank once they drift apart.
+# The rope tethers players; it is not supposed to drive them. Each person
+# plays their own run, reacting to what is in front of their own dino, and
+# feels the others as weight. Failure is shared -- one crash ends the run for
+# everyone (Simulation._check_collisions) -- so the tension is social, not
+# mechanical.
 #
-#   desync between two jumps  ->  apexes reached (free jump is 188 px)
-#     0 ms .................... 196 / 196   rope never engages
-#    50 ms .................... 167 / 212   slight tug, partner slingshotted
-#   100 ms .................... 173 / 174   still clears a large cactus
-#   167 ms ..................... 83 /  77   CLIFF: neither clears a large cactus
-#   solo jump .................. 83 /  77   partner ripped 77 px off the floor
+# The original tuning (K=16, MAX_STRETCH=40) contradicted the game's own
+# geometry. Players stand PLAYER_SPACING_X apart, so the same cactus reaches
+# them at different times and they are FORCED to jump out of sync:
 #
-# Past ~167 ms the late player has already been yanked airborne, so their jump
-# input is silently eaten -- they cannot jump because they are not grounded.
-# That is the punish. By ~500 ms they have landed and can act again, which is
-# what keeps it recoverable.
-K_ROPE: Final[float] = 16.0  # spring constant on vertical separation
-ROPE_DAMP: Final[float] = 0.3  # damping on relative vertical velocity
+#   at BASE_SPEED ..... 262 ms apart
+#   at 700 px/s ....... 157 ms apart
+#   at MAX_SPEED ...... 100 ms apart
+#
+# ...while the rope's cliff sat at ~150 ms. Correct play was punished from the
+# first obstacle: two bots each playing their own game averaged 18 m against
+# 371 m solo -- the rope was eating 95% of the run.
+#
+# Retuned against that geometry. The apex each dino reaches when the second
+# jumps late, free jump being 196 px and a large cactus 82 px:
+#
+#   desync      before        after
+#     0 ms .... 196 ....... 196     in sync, rope never engages
+#   157 ms ....  77 XX .... 164     the forced offset at speed
+#   262 ms ....  77 XX .... 151     the forced offset at the start
+#   500 ms ....  83 ....... 151     properly out of sync, still survivable
+#                (XX = clips a large cactus: an unavoidable death)
+#
+# Being 262 ms apart now costs 45 px of jump height -- a quarter of your jump,
+# clearly felt as the rope holding you back -- instead of costing the run. Two
+# independent bots now average 346 m, 93% of solo.
+K_ROPE: Final[float] = 6.0  # spring constant on vertical separation
+ROPE_DAMP: Final[float] = 0.2  # damping on relative vertical velocity
+K_ROPE: Final[float] = 6.0  # spring constant on vertical separation
+ROPE_DAMP: Final[float] = 0.2  # damping on relative vertical velocity
 
-# NB: this is far below the 220 the design sketch suggested, and it has to be.
-# Two dinos can never be more than one jump height apart (~196 px, one at apex
-# and one on the floor), so a 220 px limit is physically unreachable and the
-# stiffening branch would be dead code. At 40 px the rope has a short elastic
-# toe and then genuinely runs out of give -- which is what makes it read as a
-# rope rather than a rubber band.
-MAX_STRETCH: Final[float] = 40.0  # px beyond which the rope stiffens hard
-STRETCH_STIFFNESS: Final[float] = 14.0  # multiplier past MAX_STRETCH
+# The ceiling is physical: two dinos can never be more than one jump height
+# apart (~196 px, one at apex and one on the floor), so anything at or above
+# that is unreachable and the stiffening branch below would be dead code.
+# 170 leaves a live band at the very top of what is possible.
+#
+# It is also the denominator of rope_tension(), which drives the HUD meter and
+# the screen shake -- so it is a UI number as much as a physics one. Measured
+# over 12 bot runs, the cost of setting it too low:
+#
+#   MAX_STRETCH   meter pinned red   screen shakes
+#         90            23.8%          67 / min     unreadable, shaking constantly
+#        120            13.3%          67 / min
+#        150             4.5%          37 / min
+#        170             1.1%          16 / min     <- chosen
+#        196             0.1%           5 / min     stiffening never engages
+MAX_STRETCH: Final[float] = 170.0  # px beyond which the rope stiffens hard
+STRETCH_STIFFNESS: Final[float] = 6.0  # multiplier past MAX_STRETCH
 
 # ---------------------------------------------------------------------------
 # World / difficulty ramp
@@ -507,7 +534,11 @@ PIXELS_PER_METRE: Final[float] = 100.0
 # approaches MAX_STRETCH, so tension is readable at a glance.
 ROPE_WIDTH: Final[float] = 3.0  # slack
 ROPE_WIDTH_TAUT: Final[float] = 1.6  # at full stretch
-ROPE_SAG_MAX: Final[float] = 34.0  # px of droop when fully slack
+# Droop when slack. Raised with MAX_STRETCH: a rope with four times the give
+# has to LOOK like it has slack to spare, or players read the old taut line as
+# "we are already at the limit" and keep trying to jump in lockstep. The
+# renderer still clamps this so the curve never sinks through the ground.
+ROPE_SAG_MAX: Final[float] = 60.0  # px of droop when fully slack
 ROPE_SEGMENTS: Final[int] = 14  # polyline resolution for the sag curve
 ROPE_MIN_CLEARANCE: Final[float] = 6.0  # keep the droop from sinking into the ground
 
