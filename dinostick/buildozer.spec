@@ -55,7 +55,11 @@ android.permissions = INTERNET, ACCESS_NETWORK_STATE, ACCESS_WIFI_STATE, CHANGE_
 
 android.api = 34
 android.minapi = 24
-android.archs = arm64-v8a, armeabi-v7a
+# arm64 only. Every Android phone shipped since about 2016 is arm64, and each
+# extra arch is a full second compile of Python, Kivy and every recipe -- it
+# roughly doubles the build. Add "armeabi-v7a" back here if you need to run on
+# genuinely old hardware.
+android.archs = arm64-v8a
 
 android.allow_backup = True
 

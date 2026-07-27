@@ -38,13 +38,21 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # libltdl-dev and automake are not optional, though nothing says so until
+      # you have watched a build die: p4a builds libffi from source, and its
+      # configure.ac calls LT_SYS_SYMBOL_USCORE, which lives in libtool's m4
+      # macros. Without them autoreconf fails with "possibly undefined macro"
+      # 130 lines above anything that looks like an error.
+      # No --no-install-recommends here for the same reason -- it drops pieces
+      # of the autotools chain that the recipes turn out to need.
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            git zip unzip autoconf libtool pkg-config \
+          sudo apt-get install -y \
+            build-essential git zip unzip m4 pkg-config \
+            autoconf automake libtool libtool-bin libltdl-dev \
             zlib1g-dev libncurses-dev libffi-dev libssl-dev \
-            cmake ccache
+            python3-dev cmake ccache
           python -m pip install --upgrade pip
           # 1.6.0 or newer: adaptive launcher icons (icon.adaptive_*.filename)
           # are ignored without a word on 1.5.0.
