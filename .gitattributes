@@ -1,0 +1,17 @@
+# Normalise text files in the repo, but keep Windows scripts CRLF.
+# cmd.exe mis-parses .bat files that have bare LF line endings -- multi-line
+# `if (...)` blocks in particular just fail silently -- so these must never be
+# checked out with Unix endings.
+* text=auto
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+*.sh text eol=lf
+*.py text eol=lf
+
+*.png binary
+*.wav binary
+*.ogg binary
+*.ttf binary

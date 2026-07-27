@@ -1,0 +1,321 @@
+"""Draws a GameState snapshot onto a Kivy widget's canvas.
+
+Read-only with respect to the simulation: it never mutates state, so the same
+renderer serves the host (live state) and clients (interpolated snapshots).
+
+Coordinates: the sim works in a fixed DESIGN_WIDTH x DESIGN_HEIGHT space with
+y measured up from the ground line. The renderer fits that space to the real
+widget with a single uniform scale (see _scale), so devices with different
+screen shapes agree on where everything is in world terms AND draw the same
+undistorted characters -- a phone panel is nowhere near 16:9, and scaling the
+axes independently to fill it squashed every dino.
+
+The renderer owns a little transient visual state of its own -- screen shake
+and crash particles -- because those are pure presentation and should never
+travel over the network or affect the simulation.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from typing import Any
+
+from kivy.graphics import (Color, Ellipse, Line, PopMatrix, PushMatrix,
+                           Rectangle, Translate, Triangle)
+
+from . import constants as C
+from .entities import GameState, Player
+from .physics import rope_tension
+
+
+def _shade(color, factor: float):
+    """Lighten/darken a skin colour for a body part, keeping alpha."""
+    if factor == 1.0:
+        return color
+    return (min(1.0, color[0] * factor), min(1.0, color[1] * factor),
+            min(1.0, color[2] * factor), color[3])
+
+
+class Particle:
+    __slots__ = ("x", "y", "vx", "vy", "life", "color")
+
+    def __init__(self, x: float, y: float, color) -> None:
+        angle = random.uniform(0.0, math.tau)
+        speed = random.uniform(0.35, 1.0) * C.PARTICLE_SPEED
+        self.x = x
+        self.y = y
+        self.vx = math.cos(angle) * speed
+        self.vy = math.sin(angle) * speed + C.PARTICLE_SPEED * 0.4
+        self.life = C.PARTICLE_LIFETIME
+        self.color = color
+
+
+class Renderer:
+    """Owns the canvas instructions for one game view."""
+
+    def __init__(self, widget: Any) -> None:
+        self.widget = widget
+        self._particles: list[Particle] = []
+        self._shake = 0.0
+        self._prev_tension = 0.0
+        self._scroll = 0.0  # parallax offset, advanced from world speed
+
+    # -- juice hooks --------------------------------------------------------
+
+    def burst(self, x: float, y: float, color=C.COLOR_DANGER) -> None:
+        """Spray particles at a world position (used on crash)."""
+        for _ in range(C.PARTICLE_COUNT):
+            self._particles.append(Particle(x, y, color))
+
+    def shake(self, amount: float = 1.0) -> None:
+        self._shake = max(self._shake, C.SHAKE_DURATION * amount)
+
+    def advance(self, dt: float, state: GameState) -> None:
+        """Step the presentation-only animation. Call once per rendered frame."""
+        self._scroll += state.speed * dt
+
+        if self._shake > 0.0:
+            self._shake = max(0.0, self._shake - dt)
+
+        alive = []
+        for p in self._particles:
+            p.life -= dt
+            if p.life <= 0.0:
+                continue
+            p.vy += C.PARTICLE_GRAVITY * dt
+            p.x += p.vx * dt
+            p.y += p.vy * dt
+            alive.append(p)
+        self._particles = alive
+
+        # A rope that snaps from slack to fully taut in one frame is a hard
+        # yank -- worth a jolt. Rising edge only, so a sustained taut rope
+        # does not shake forever.
+        tension = max((rope_tension(state.players, i)
+                       for i in range(max(0, len(state.players) - 1))),
+                      default=0.0)
+        if (tension >= C.SHAKE_TENSION_TRIGGER
+                and self._prev_tension < C.SHAKE_TENSION_TRIGGER):
+            self.shake(0.6)
+        self._prev_tension = tension
+
+    # -- design space -> widget space ---------------------------------------
+
+    def _scale(self) -> float:
+        """One scale for both axes, so nothing is ever stretched or squashed.
+
+        Sized to the width (see VIEW_MIN_HEIGHT), which is what keeps the whole
+        runway visible on any screen shape; the cap stops a squat window from
+        scaling the world up until the jump apex leaves the screen.
+        """
+        return min(self.widget.width / C.DESIGN_WIDTH,
+                   self.widget.height / C.VIEW_MIN_HEIGHT)
+
+    def _origin(self) -> tuple[float, float]:
+        """Where design (0, 0) lands in widget coordinates.
+
+        Ground-anchored: spare height is sky above, never a gap below the
+        ground line. Spare width -- only possible on a very squat window --
+        goes on the LEFT, so the design's right edge stays flush with the
+        screen's. Obstacles spawn just off that edge, and pushing it inward
+        would let players watch them appear out of nothing.
+        """
+        s = self._scale()
+        return (self.widget.right - C.DESIGN_WIDTH * s, self.widget.y)
+
+    def _visible_x(self) -> tuple[float, float]:
+        """The design-space x range the widget actually shows."""
+        s = self._scale()
+        ox, _ = self._origin()
+        return ((self.widget.x - ox) / s, (self.widget.right - ox) / s)
+
+    def _place(self, x: float, y: float, w: float, h: float
+               ) -> tuple[tuple[float, float], tuple[float, float]]:
+        """Map a sim-space rect (y = height above ground) to widget pos/size."""
+        s = self._scale()
+        ox, oy = self._origin()
+        return ((ox + x * s, oy + (C.GROUND_Y + y) * s), (w * s, h * s))
+
+    # -- drawing ------------------------------------------------------------
+
+    def draw(self, state: GameState) -> None:
+        widget = self.widget
+        widget.canvas.clear()
+
+        offset = (0.0, 0.0)
+        if self._shake > 0.0:
+            mag = C.SHAKE_MAGNITUDE * (self._shake / C.SHAKE_DURATION)
+            offset = (random.uniform(-mag, mag), random.uniform(-mag, mag))
+
+        with widget.canvas:
+            Color(*C.COLOR_BG)
+            Rectangle(pos=widget.pos, size=widget.size)
+
+            PushMatrix()
+            Translate(offset[0], offset[1], 0)
+
+            self._draw_parallax()
+            self._draw_ground()
+
+            for powerup in state.powerups:
+                self._draw_powerup(powerup)
+
+            Color(*C.COLOR_FG)
+            for obstacle in state.obstacles:
+                w, h = C.OBSTACLE_SIZES[obstacle.kind]
+                pos, size = self._place(obstacle.x, obstacle.y, w, h)
+                Rectangle(pos=pos, size=size)
+
+            # Rope first, so the dinos draw over the knots.
+            self._draw_rope(state)
+            for player in state.players:
+                self._draw_player(player, state)
+
+            self._draw_particles()
+
+            PopMatrix()
+
+    def _draw_parallax(self) -> None:
+        """Rolling hills at fractional scroll speeds, for depth.
+
+        Each hill is the TOP HALF of an ellipse straddling the ground line, so
+        it reads as a dome resting on the horizon. Drawing whole ellipses
+        instead leaves their lower half hanging below the ground line, since
+        nothing occludes it.
+        """
+        spacing = C.PARALLAX_HILL_SPACING
+        width = C.PARALLAX_HILL_WIDTH
+        # Tile across whatever is actually on screen, not across the design
+        # width: a screen wider than the design space would otherwise end in
+        # bare horizon on the left where the hills ran out.
+        left, right = self._visible_x()
+        for factor, height, color in C.PARALLAX_LAYERS:
+            Color(*color)
+            shift = (self._scroll * factor) % spacing
+            x = left - shift - width
+            while x < right + width:
+                # Centre the ellipse on the ground line and keep only the top.
+                pos, size = self._place(x, -height, width, height * 2.0)
+                Ellipse(pos=pos, size=size, angle_start=-90, angle_end=90)
+                x += spacing
+
+    def _draw_ground(self) -> None:
+        s = self._scale()
+        widget = self.widget
+        _, ground_y = self._origin()
+        ground_y += C.GROUND_Y * s
+        Color(*C.COLOR_GROUND)
+        Line(points=[widget.x, ground_y, widget.right, ground_y],
+             width=C.GROUND_LINE_WIDTH * s)
+
+    def _draw_powerup(self, powerup) -> None:
+        color = C.POWERUP_COLORS.get(powerup.kind, C.COLOR_ACCENT)
+        w, h = C.POWERUP_SIZE
+        Color(*color)
+        pos, size = self._place(powerup.x, powerup.y, w, h)
+        Ellipse(pos=pos, size=size)
+        Color(1, 1, 1, 0.85)
+        pos, size = self._place(powerup.x + w * 0.3, powerup.y + h * 0.3,
+                                w * 0.4, h * 0.4)
+        Ellipse(pos=pos, size=size)
+
+    def _draw_rope(self, state: GameState) -> None:
+        """Draw each rope segment, sagging when slack and taut when stretched."""
+        for i in range(len(state.players) - 1):
+            left, right = state.players[i], state.players[i + 1]
+            tension = rope_tension(state.players, i)
+
+            ax = left.x + C.PLAYER_WIDTH * 0.5
+            ay = left.y + left.hitbox().h * 0.5
+            bx = right.x + C.PLAYER_WIDTH * 0.5
+            by = right.y + right.hitbox().h * 0.5
+
+            # Slack rope droops; the droop is pulled out as tension rises.
+            sag = C.ROPE_SAG_MAX * (1.0 - tension)
+            # ...but never let the droop sink through the ground line, which it
+            # otherwise does whenever both dinos are standing still.
+            midpoint = (ay + by) * 0.5
+            sag = min(sag, max(0.0, midpoint - C.ROPE_MIN_CLEARANCE))
+
+            points: list[float] = []
+            for step in range(C.ROPE_SEGMENTS + 1):
+                u = step / C.ROPE_SEGMENTS
+                x = ax + (bx - ax) * u
+                y = ay + (by - ay) * u
+                y -= 4.0 * sag * u * (1.0 - u)  # parabolic approx of a catenary
+                pos, _ = self._place(x, y, 0.0, 0.0)
+                points.extend(pos)
+
+            slack_c, taut_c = C.COLOR_ROPE, C.COLOR_ROPE_TAUT
+            Color(*[slack_c[j] + (taut_c[j] - slack_c[j]) * tension
+                    for j in range(4)])
+            width = C.ROPE_WIDTH + (C.ROPE_WIDTH_TAUT - C.ROPE_WIDTH) * tension
+            Line(points=points, width=max(1.0, width * self._scale()))
+
+    def _draw_player(self, player: Player, state: GameState) -> None:
+        """Draw one character inside its hitbox.
+
+        Every part is given in coordinates normalised to the hitbox, so the
+        silhouette is confined to exactly the box the player collides with --
+        the choice of character can never change anyone's hitbox -- and ducking
+        squashes the whole creature for free, because the box itself shrinks.
+        """
+        box = player.hitbox()
+        skin = C.SKINS[player.skin % len(C.SKINS)]
+        base = skin["color"] if player.alive else C.COLOR_DANGER
+
+        for part in skin["parts"]:
+            Color(*_shade(base, part.get("s", 1.0)))
+            if part["k"] == "tri":
+                p = part["p"]
+                points: list[float] = []
+                for i in range(0, 6, 2):
+                    points.extend(self._pt(box, p[i], p[i + 1]))
+                Triangle(points=points)
+            else:
+                x, y, w, h = part["r"]
+                pos, size = self._place(box.x + x * box.w, box.y + y * box.h,
+                                        w * box.w, h * box.h)
+                (Ellipse if part["k"] == "ellipse" else Rectangle)(
+                    pos=pos, size=size)
+
+        # A shield covers the whole team, so ring every dino.
+        if state.shield:
+            Color(*C.POWERUP_COLORS[C.POWERUP_SHIELD])
+            pos, size = self._place(box.x - 6, box.y - 6, box.w + 12, box.h + 12)
+            Line(rectangle=(pos[0], pos[1], size[0], size[1]), width=1.6)
+
+        # Eye, placed per character; they all face right, into the obstacles.
+        ex, ey = skin["eye"]
+        pos, size = self._place(box.x + ex * box.w - C.EYE_SIZE * 0.5,
+                                box.y + ey * box.h - C.EYE_SIZE * 0.5,
+                                C.EYE_SIZE, C.EYE_SIZE)
+        Color(*C.COLOR_EYE)
+        Ellipse(pos=pos, size=size)
+        Color(0.12, 0.12, 0.12, 1.0)
+        pos, size = self._place(box.x + ex * box.w - C.EYE_SIZE * 0.18,
+                                box.y + ey * box.h - C.EYE_SIZE * 0.18,
+                                C.EYE_SIZE * 0.42, C.EYE_SIZE * 0.42)
+        Ellipse(pos=pos, size=size)
+
+    def _pt(self, box, fx: float, fy: float) -> tuple[float, float]:
+        """A hitbox-normalised point in widget coordinates."""
+        pos, _ = self._place(box.x + fx * box.w, box.y + fy * box.h, 0.0, 0.0)
+        return pos
+
+    def _draw_particles(self) -> None:
+        for p in self._particles:
+            fade = max(0.0, p.life / C.PARTICLE_LIFETIME)
+            Color(p.color[0], p.color[1], p.color[2], fade)
+            pos, size = self._place(p.x, p.y, C.PARTICLE_SIZE, C.PARTICLE_SIZE)
+            Ellipse(pos=pos, size=size)
+
+    # -- helpers for the HUD ------------------------------------------------
+
+    def player_screen_pos(self, player: Player) -> tuple[float, float]:
+        """Top-centre of a dino in widget coordinates, for nameplates."""
+        box = player.hitbox()
+        pos, size = self._place(box.x, box.y + box.h + C.NAMEPLATE_OFFSET,
+                                box.w, 0.0)
+        return (pos[0] + size[0] * 0.5, pos[1])
