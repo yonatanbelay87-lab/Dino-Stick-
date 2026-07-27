@@ -3,7 +3,7 @@
 Builds the ScreenManager, and owns the network session plus the single pump
 that drains socket queues on the main thread.
 
-Run with:
+Run with
 
     python main.py
 
