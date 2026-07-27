@@ -557,25 +557,65 @@ keyboard on a tablet does not fight the on-screen zones.
 
 ## Build the APK
 
-Buildozer does not run on Windows; use WSL, a Linux box, or a VM. `buildozer.spec`
+Buildozer does not run on Windows, so the build happens in CI. `buildozer.spec`
 is already written — do **not** run `buildozer init`, it would overwrite it.
 
+### The normal way: GitHub Actions
+
+`.github/workflows/android.yml` builds a debug APK on every push that touches
+`dinostick/`, and on demand from the **Actions** tab → *Android APK* → *Run
+workflow*. When it finishes, the APK is on the run's summary page under
+**Artifacts** → `dinostick-debug-apk`.
+
+To install it: unzip the artifact, copy the `.apk` to the phone, and open it.
+Android will ask you to allow installs from whatever app you opened it with —
+that is expected for a debug build, which is signed with a throwaway key rather
+than a real one.
+
+A cold run takes 30–45 minutes (it downloads and unpacks the whole Android
+SDK/NDK); after that the cache brings it down to a few minutes. Buildozer is
+pinned to **1.6.0** because adaptive launcher icons are silently ignored on
+1.5.0 — see the note in `buildozer.spec`.
+
+The workflow also unpacks the finished APK and asserts all 16 season images are
+actually inside it. That check exists because a missing backdrop does not crash
+the game — it quietly falls back to the grey hills, which is easy to miss.
+
+### Locally, if you want fast iteration
+
+Needs WSL, a Linux box or a VM, and roughly 5GB of SDK/NDK on first run:
+
 ```bash
-# In WSL/Ubuntu. These need sudo and will prompt for your password.
 sudo apt update
 sudo apt install -y git zip unzip openjdk-17-jdk python3-pip autoconf libtool \
                     pkg-config zlib1g-dev libncurses-dev cmake libffi-dev libssl-dev
-pip3 install --user --upgrade buildozer cython==0.29.36
+pip3 install --user --upgrade buildozer==1.6.0 cython==0.29.36
 
 cd /mnt/c/Users/<you>/Desktop/Dino\ Stick/Dino-Stick-/dinostick
-buildozer -v android debug          # first run downloads ~5GB of SDK/NDK
+buildozer -v android debug
 ```
 
-The APK lands in `bin/`. Install and run it with:
+The APK lands in `bin/`. With a phone plugged in and USB debugging on:
 
 ```bash
 buildozer android deploy run logcat
 ```
+
+### Branding
+
+The launcher icon and splash are **generated**, not hand-drawn:
+
+```bash
+python tools/make_branding.py
+```
+
+It draws the dino straight from `SKINS` and crops the backdrop from the season
+the game opens on, writing `icon.png` (legacy), `icon_fg.png` / `icon_bg.png`
+(the two adaptive layers Android 8+ masks into the launcher's shape) and
+`presplash.png`. Re-run it after changing a character or the first season's
+art, so the icon cannot drift from the game. `android.presplash_color` is
+sampled from the splash image's own edge columns — that colour fills the bars
+either side of it on a landscape phone.
 
 ### Android gotcha: the multicast lock
 

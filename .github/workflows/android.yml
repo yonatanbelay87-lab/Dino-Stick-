@@ -1,0 +1,113 @@
+name: Android APK
+
+# Buildozer cannot run on Windows, so the APK is built here instead of on the
+# dev machine. Run it from the Actions tab ("Run workflow"), or let it fire on
+# a push that touches the game.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'dinostick/**'
+      - '.github/workflows/android.yml'
+  pull_request:
+    paths:
+      - 'dinostick/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # A cold build downloads and unpacks the whole Android SDK + NDK.
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # p4a's recipes are still happiest on 3.11: 3.12 removed distutils and
+      # several of them have not caught up.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 17 is what the current Android Gradle Plugin wants. 21 fails the build.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git zip unzip autoconf libtool pkg-config \
+            zlib1g-dev libncurses-dev libffi-dev libssl-dev \
+            cmake ccache
+          python -m pip install --upgrade pip
+          # 1.6.0 or newer: adaptive launcher icons (icon.adaptive_*.filename)
+          # are ignored without a word on 1.5.0.
+          pip install buildozer==1.6.0 cython==0.29.36
+
+      # ~5GB of SDK/NDK. Without this every run re-downloads it and takes the
+      # best part of an hour; with it, a warm run is a few minutes.
+      - name: Cache Android SDK/NDK
+        uses: actions/cache@v4
+        with:
+          path: ~/.buildozer
+          key: buildozer-global-${{ runner.os }}-${{ hashFiles('dinostick/buildozer.spec') }}
+          restore-keys: |
+            buildozer-global-${{ runner.os }}-
+
+      # The compiled Python distribution and recipes for this app specifically.
+      - name: Cache build directory
+        uses: actions/cache@v4
+        with:
+          path: dinostick/.buildozer
+          key: buildozer-local-${{ runner.os }}-${{ hashFiles('dinostick/buildozer.spec') }}
+          restore-keys: |
+            buildozer-local-${{ runner.os }}-
+
+      - name: Build debug APK
+        working-directory: dinostick
+        run: buildozer -v android debug
+
+      # Uploaded BEFORE the checks below, so a failed assertion still leaves
+      # you an APK to look at rather than throwing the whole 40 minutes away.
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: dinostick-debug-apk
+          path: dinostick/bin/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      # The season art lives in a folder whose name contains spaces, and it is
+      # 31MB of the APK. Both are worth confirming actually made it in rather
+      # than finding out on the phone: a missing backdrop does not crash the
+      # game, it silently falls back to the old grey hills.
+      - name: Verify the assets were packaged
+        working-directory: dinostick
+        run: |
+          set -euo pipefail
+          apk=$(ls bin/*.apk | head -1)
+          echo "APK: $apk  ($(du -h "$apk" | cut -f1))"
+          rm -rf /tmp/apk && mkdir -p /tmp/apk
+          unzip -q -o "$apk" -d /tmp/apk
+          bundle=$(find /tmp/apk/assets -maxdepth 1 -name 'private*' | head -1)
+          echo "app bundle: $bundle"
+          listing=$(tar tzf "$bundle")
+          seasons=$(echo "$listing" | grep -c 'Dino-Stick BG pics/.*\.png' || true)
+          echo "season images packaged: $seasons"
+          echo "$listing" | grep 'Dino-Stick BG pics' | head -20
+          test "$seasons" -eq 16 || { echo "::error::expected 16 season images, found $seasons"; exit 1; }
+          echo "$listing" | grep -q 'assets/icon.png' && echo "icon packaged"
+          echo "$listing" | grep -qE 'assets/sounds/.*\.wav' && echo "sounds packaged"
+          # Adaptive icon: buildozer only emits these when BOTH layers are set,
+          # and it says nothing when it skips them.
+          if unzip -l "$apk" | grep -q 'mipmap-anydpi-v26'; then
+            echo "adaptive launcher icon present"
+          else
+            echo "::warning::no adaptive icon -- Android 8+ will letterbox the flat one"
+          fi
