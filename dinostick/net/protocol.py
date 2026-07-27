@@ -1,9 +1,16 @@
-"""Wire protocol: message-type constants + length-prefixed JSON framing.
+"""Wire protocol: message-type constants + framing for both transports.
 
-Framing: a 4-byte big-endian unsigned length header, then that many bytes of
-UTF-8 JSON. TCP is a byte stream with no message boundaries -- a single recv()
-can hand back half a header, three whole frames, or one and a half -- so all
-reading goes through ``FrameReader``, which buffers until a frame is complete.
+Two framings, because the two transports have opposite problems:
+
+  TCP  -- a byte stream with no message boundaries. A single recv() can hand
+          back half a header, three whole frames, or one and a half, so every
+          message carries a 4-byte big-endian length header and all reading
+          goes through ``FrameReader``, which buffers until a frame completes.
+
+  UDP  -- datagrams already preserve boundaries, so the length prefix would be
+          pure overhead: one JSON object per packet, ``pack``/``unpack``.
+          What UDP does not preserve is delivery or order, which is why every
+          gameplay packet carries a ``seq`` (see ``SeqFilter``).
 
 Nothing here imports Kivy, and nothing here knows about the game: it moves
 dicts.
@@ -17,18 +24,30 @@ from typing import Any, Iterator
 
 from game import constants as C
 
-# --- Client -> Host --------------------------------------------------------
+# --- Client -> Host, TCP ---------------------------------------------------
 MSG_JOIN: str = "join"  # {name, skin}
 MSG_READY: str = "ready"  # {ready: bool}
 MSG_SKIN: str = "skin"  # {skin: int}
-MSG_INPUT: str = "input"  # {jump: bool, duck: bool, seq: int}
 
-# --- Host -> Client(s) -----------------------------------------------------
+# --- Client -> Host, UDP ---------------------------------------------------
+MSG_INPUT: str = "input"  # {seq, jump: bool, duck: bool, tick}
+# Sent on game start so the host learns where to aim snapshots. UDP is
+# connectionless: the host knows the client's TCP socket, but that tells it
+# nothing about which port the client's UDP socket is bound to.
+MSG_UDP_REGISTER: str = "udp_register"  # {id}
+
+# --- Host -> Client(s), TCP ------------------------------------------------
 MSG_LOBBY: str = "lobby"  # {players: [...], you: id}
 MSG_START: str = "start"  # {seed, players: [...]}
-MSG_STATE: str = "state"  # {tick, players, obstacles, ...}
 MSG_GAMEOVER: str = "gameover"  # {score, distance, cause}
 MSG_REMATCH: str = "rematch"  # {}
+# One-shot events that must not be lost. Only crashes qualify: a missed jump
+# thud is nothing, a missed crash is a death with no sound, no shake and no
+# particles. The rest ride along in the snapshot.
+MSG_EVENT: str = "event"  # {events: [...]}
+
+# --- Host -> Client(s), UDP ------------------------------------------------
+MSG_STATE: str = "state"  # {seq, tick, players, obstacles, ...}
 
 # --- Latency (either direction) --------------------------------------------
 # The client stamps a ping with its own clock and the host echoes it back
@@ -100,6 +119,60 @@ def send(sock: socket.socket, msg: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Datagram framing (UDP)
+# ---------------------------------------------------------------------------
+
+
+def pack(msg: dict[str, Any]) -> bytes:
+    """Serialise one message into a single datagram. No length prefix."""
+    body = json.dumps(msg, separators=(",", ":")).encode("utf-8")
+    if len(body) > C.MAX_DATAGRAM_BYTES:
+        # Fragmenting means losing the whole packet if any fragment drops.
+        # Nothing the game sends comes close, so this is a design tripwire.
+        raise ProtocolError(f"datagram too large: {len(body)} bytes")
+    return body
+
+
+def unpack(payload: bytes) -> dict[str, Any] | None:
+    """Parse one received datagram, or None if it is not one of ours.
+
+    Returns None rather than raising: a UDP socket will happily receive a
+    stray broadcast from anything on the subnet, and one malformed packet must
+    never take down the receive thread.
+    """
+    try:
+        msg = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return msg if isinstance(msg, dict) else None
+
+
+class SeqFilter:
+    """Drops stale and duplicate datagrams from one sender.
+
+    UDP reorders and duplicates as well as losing packets. Every gameplay
+    packet supersedes the one before it, so anything not newer than what we
+    already have is simply discarded -- we never wait for a gap to be filled,
+    which is the entire point of leaving TCP behind.
+    """
+
+    __slots__ = ("last_seq",)
+
+    def __init__(self) -> None:
+        self.last_seq = -1
+
+    def accept(self, seq: int) -> bool:
+        if seq <= self.last_seq:
+            return False
+        self.last_seq = seq
+        return True
+
+    def reset(self) -> None:
+        """Between runs: a rematch restarts sequence numbers from zero."""
+        self.last_seq = -1
+
+
+# ---------------------------------------------------------------------------
 # Message builders -- typed constructors beat scattered dict literals
 # ---------------------------------------------------------------------------
 
@@ -124,8 +197,18 @@ def start(seed: int, players: list[dict[str, Any]]) -> dict[str, Any]:
     return {TYPE: MSG_START, "seed": seed, "players": players}
 
 
-def player_input(jump: bool, duck: bool, seq: int) -> dict[str, Any]:
-    return {TYPE: MSG_INPUT, "jump": jump, "duck": duck, "seq": seq}
+def player_input(jump: bool, duck: bool, seq: int, tick: int = 0
+                 ) -> dict[str, Any]:
+    return {TYPE: MSG_INPUT, "jump": jump, "duck": duck, "seq": seq,
+            "tick": tick}
+
+
+def udp_register(player_id: int) -> dict[str, Any]:
+    return {TYPE: MSG_UDP_REGISTER, "id": player_id}
+
+
+def events(items: list[dict[str, Any]]) -> dict[str, Any]:
+    return {TYPE: MSG_EVENT, "events": items}
 
 
 def gameover(score: int, distance: float, player_id: int | None,

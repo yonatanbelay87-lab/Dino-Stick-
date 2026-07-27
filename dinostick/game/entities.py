@@ -230,13 +230,42 @@ def _lerp(a: float, b: float, t: float) -> float:
     return a + (b - a) * t
 
 
-def interpolate(older: GameState, newer: GameState, t: float) -> GameState:
+def select_pair(snapshots, target: float):
+    """Find the two buffered snapshots that bracket ``target``.
+
+    Returns ``(older, newer, t)`` with t running 0..1 between their arrival
+    times, or ``None`` when the target falls outside everything buffered --
+    which means the caller has to show the newest snapshot as-is and accept a
+    visible snap.
+
+    Pulled out of the render loop so the delay and buffer size can be swept
+    against recorded arrival patterns without standing up a window. Tuning
+    INTERP_DELAY_MS by eye is how you end up with a number nobody can defend.
+    """
+    for i in range(len(snapshots) - 1):
+        older, newer = snapshots[i], snapshots[i + 1]
+        if older[0] <= target <= newer[0]:
+            span = newer[0] - older[0]
+            t = 0.0 if span <= 0 else (target - older[0]) / span
+            return older, newer, t
+    return None
+
+
+def interpolate(older: GameState, newer: GameState, t: float,
+                skip_ids: frozenset[int] | set[int] = frozenset()
+                ) -> GameState:
     """Blend two snapshots for smooth client rendering.
 
     ``t`` runs 0 (show ``older``) to 1 (show ``newer``). Players are matched by
     id and obstacles by ``oid``; anything present in only one of the two
     snapshots is taken as-is rather than blended, which is what stops obstacles
     from sliding in from the wrong place as they spawn and despawn.
+
+    ``skip_ids`` names players that must not be blended -- in practice, the
+    one you are controlling. Interpolation renders the past, and the past is
+    the one place your own dino must never be: you press jump and expect to
+    leave the ground now, not INTERP_DELAY_MS from now. That player is drawn
+    from prediction instead (see the client-side prediction in screens/game).
     """
     t = max(0.0, min(1.0, t))
 
@@ -244,7 +273,7 @@ def interpolate(older: GameState, newer: GameState, t: float) -> GameState:
     players = []
     for new in newer.players:
         old = old_players.get(new.id)
-        if old is None:
+        if old is None or new.id in skip_ids:
             players.append(new)
             continue
         blended = Player(

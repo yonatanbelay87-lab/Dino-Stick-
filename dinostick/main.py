@@ -16,7 +16,6 @@ from __future__ import annotations
 import os
 import queue
 import sys
-import time
 from collections import deque
 
 # Allow `python main.py` from anywhere: put this directory on sys.path so the
@@ -29,6 +28,7 @@ from kivy.core.window import Window  # noqa: E402
 from kivy.uix.screenmanager import NoTransition, ScreenManager  # noqa: E402
 
 from game import constants as C  # noqa: E402
+from game import timing  # noqa: E402
 from game.entities import snapshot_to_state  # noqa: E402
 from net import protocol  # noqa: E402
 from net.client import GameClient  # noqa: E402
@@ -236,6 +236,16 @@ class DinoStickApp(App):
                 break
             self._on_client_message(msg)
 
+        # The gameplay stream is drained separately: it arrives on its own
+        # socket and its own thread, and must not be held up behind control
+        # traffic (nor hold control traffic up).
+        while self.client is client:
+            try:
+                msg = client.udp_inbox.get_nowait()
+            except queue.Empty:
+                break
+            self._on_client_message(msg)
+
     def _on_client_message(self, msg: dict) -> None:
         kind = msg.get(protocol.TYPE)
 
@@ -250,11 +260,19 @@ class DinoStickApp(App):
             self.roster = {int(p["id"]): (p["name"], int(p["skin"]))
                            for p in players}
             self.snapshots.clear()
+            if self.client is not None:
+                self.client.begin_run()
             self.sm.current = GAME
+
+        elif kind == protocol.MSG_EVENT:
+            # Crashes, delivered reliably over TCP rather than left to the
+            # snapshot stream. Handed to the game screen to fire once.
+            self.sm.get_screen(GAME).fire_reliable_events(
+                msg.get("events", []))
 
         elif kind == protocol.MSG_STATE:
             state = snapshot_to_state(msg, self.roster)
-            self.snapshots.append((time.monotonic(), state))
+            self.snapshots.append((timing.now(), state))
 
         elif kind == protocol.MSG_GAMEOVER:
             cause = msg.get("cause") or {}
@@ -274,6 +292,8 @@ class DinoStickApp(App):
 
         elif kind == protocol.MSG_REMATCH:
             self.snapshots.clear()
+            if self.client is not None:
+                self.client.begin_run()
 
         elif kind == "_disconnected":
             # The client knows *why* when it timed out rather than being

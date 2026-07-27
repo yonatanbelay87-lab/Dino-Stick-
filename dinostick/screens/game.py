@@ -12,7 +12,6 @@ Three modes share this screen:
 from __future__ import annotations
 
 import random
-import time
 
 from kivy.animation import Animation
 from kivy.app import App
@@ -27,11 +26,13 @@ from kivy.uix.widget import Widget
 from kivy.utils import platform
 
 from game import constants as C
-from game.entities import interpolate
+from game import timing
+from game.entities import interpolate, select_pair
 from game.game_input import InputMapper
 from game.physics import rope_tension
 from game.renderer import Renderer
-from game.simulation import Simulation, make_players
+from game.prediction import LocalPredictor
+from game.simulation import Simulation, make_players, modifiers_for
 from ui import audio, theme
 from ui import format as fmt
 from ui.widgets import Badge, Card, Meter, Stat, TouchButton
@@ -85,6 +86,8 @@ class GameScreen(Screen):
         self._accumulator = 0.0
         self._mode = "local"
         self._last_event_tick = -1
+        # Client mode only: runs this device's own dino ahead of the network.
+        self._predictor = LocalPredictor()
         audio.preload()
 
         root = FloatLayout()
@@ -276,6 +279,9 @@ class GameScreen(Screen):
             self.mapper.unbind_keyboard()
             self.mapper = None
         self.view.mapper = None
+        # Never carry a prediction across runs: a rematch reseeds the world,
+        # and last run's dino would be blended into the new one.
+        self._predictor.stop()
 
     # -- the loop -----------------------------------------------------------
 
@@ -351,7 +357,7 @@ class GameScreen(Screen):
     def _frame_client(self, app, frame_dt: float) -> None:
         """Render the host's world, interpolated between two snapshots.
 
-        We deliberately render CLIENT_RENDER_DELAY in the past. That way there
+        We deliberately render INTERP_DELAY in the past. That way there
         is virtually always a newer snapshot to interpolate *toward*; rendering
         at the newest packet instead would leave the world frozen every time
         one arrived late.
@@ -361,7 +367,16 @@ class GameScreen(Screen):
 
         if self.mapper is not None:
             local = self.mapper.states[0]
-            app.client.send_input(local.jump, local.duck)
+            # Every frame now, not just on change: over UDP the resend IS the
+            # reliability mechanism (client.send_input rate-limits to
+            # INPUT_HZ). The tick we last rendered rides along so the host can
+            # tell how far behind us this input was formed.
+            app.client.send_input(local.jump, local.duck,
+                                  tick=self._last_event_tick)
+            # The same input drives prediction immediately -- that is the
+            # whole point: the jump starts on this frame, not when the host's
+            # answer gets back.
+            self._predictor.set_input(local.jump, local.duck)
         app.client.maybe_ping()
 
         snapshots = app.snapshots
@@ -379,23 +394,67 @@ class GameScreen(Screen):
         if pending:
             self._fire_events(pending, snapshots[-1][1])
 
-        target = time.monotonic() - C.CLIENT_RENDER_DELAY
+        # Prediction runs on the newest authoritative word, not the delayed
+        # view: it is meant to be ahead of the network, not behind it. Its
+        # age matters as much as its contents -- see LocalPredictor._catch_up.
+        newest_at, newest = snapshots[-1]
+        self._advance_prediction(newest, timing.now() - newest_at, frame_dt)
 
-        older = newer = None
-        for i in range(len(snapshots) - 1):
-            if snapshots[i][0] <= target <= snapshots[i + 1][0]:
-                older, newer = snapshots[i], snapshots[i + 1]
-                break
+        # Render INTERP_DELAY in the past, so there is a snapshot on each side
+        # of this instant to interpolate between. Drawing the newest snapshot
+        # as it lands would move the world in snapshot-rate lurches across a
+        # faster screen; this trades a fixed delay for continuous motion.
+        target = timing.now() - C.INTERP_DELAY
 
-        if older is None or newer is None:
-            # Target is outside the buffer (just joined, or a stall): show the
-            # newest thing we have rather than nothing.
-            self._present(snapshots[-1][1], frame_dt)
+        pair = select_pair(snapshots, target)
+        if pair is None:
+            # No bracketing pair: we just joined, or the stream stalled for
+            # longer than the buffer holds. Showing the newest snapshot is a
+            # visible snap, so it is the fallback, never the normal path.
+            view = snapshots[-1][1]
+        else:
+            older, newer, t = pair
+            view = interpolate(older[1], newer[1], t,
+                               skip_ids=self._local_ids())
+
+        # Last word on the local dino: everyone else is the host's version,
+        # delayed and smoothed; yours is the one you are driving right now.
+        self._predictor.apply_to(view)
+        self._present(view, frame_dt)
+
+    def _advance_prediction(self, authoritative, age: float,
+                            frame_dt: float) -> None:
+        """Step the local dino forward, then ease it toward the host's truth."""
+        app = App.get_running_app()
+        local_id = None
+        if app is not None and app.client is not None:
+            local_id = app.client.player_id
+        if local_id is None:
             return
 
-        span = newer[0] - older[0]
-        t = 0.0 if span <= 0 else (target - older[0]) / span
-        self._present(interpolate(older[1], newer[1], t), frame_dt)
+        auth = next((p for p in authoritative.players if p.id == local_id),
+                    None)
+        if auth is None:
+            self._predictor.stop()
+            return
+
+        if not self._predictor.active:
+            self._predictor.begin(auth)
+            return
+
+        mods = modifiers_for(authoritative.effects)
+        # Order matters: advance first, then correct. Correcting a prediction
+        # that has not yet accounted for this frame's input would blend away
+        # the jump before it was ever drawn.
+        self._predictor.step(frame_dt, mods)
+        self._predictor.reconcile(auth, age, mods)
+
+    def _local_ids(self) -> frozenset[int]:
+        """The player this device controls, who must not be interpolated."""
+        app = App.get_running_app()
+        if app is None or app.client is None or app.client.player_id is None:
+            return frozenset()
+        return frozenset({app.client.player_id})
 
     # -- presentation -------------------------------------------------------
 
@@ -460,6 +519,21 @@ class GameScreen(Screen):
         if self._mode == "client" or not state.events:
             return
         self._fire_events(state.events, state)
+
+    def fire_reliable_events(self, events: list[dict]) -> None:
+        """Events the host sent over TCP because they must not be lost.
+
+        Only crashes take this path. They are stripped from the snapshot
+        stream host-side, so there is no risk of firing one twice.
+        """
+        if not events:
+            return
+        app = App.get_running_app()
+        snapshots = app.snapshots if app is not None else None
+        if not snapshots:
+            audio.play_events(events)
+            return
+        self._fire_events(events, snapshots[-1][1])
 
     def _fire_events(self, events: list[dict], state) -> None:
         audio.play_events(events)

@@ -21,11 +21,11 @@ import queue
 import random
 import socket
 import threading
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from game import constants as C
+from game import timing
 from game.entities import Player, state_to_snapshot
 from game.simulation import Simulation
 
@@ -49,7 +49,7 @@ class ClientConn:
     alive: bool = True
     # When we last heard anything at all from this client. Clients ping once a
     # second in every screen, so silence is the signal that one has gone.
-    last_rx: float = field(default_factory=time.monotonic)
+    last_rx: float = field(default_factory=timing.now)
 
 
 class GameHost:
@@ -73,6 +73,17 @@ class GameHost:
         self._accept_thread: threading.Thread | None = None
         self._stop = threading.Event()
 
+        # The gameplay stream. Snapshots go out from the main thread via
+        # sendto(); inputs arrive on a dedicated reader thread.
+        self._udp: socket.socket | None = None
+        self._udp_thread: threading.Thread | None = None
+        # player id -> (ip, port) learned from that client's udp_register.
+        self._udp_endpoints: dict[int, tuple[str, int]] = {}
+        # Per-sender sequence filters, so a reordered input cannot undo a
+        # newer one. Keyed by player id.
+        self._input_seq: dict[int, protocol.SeqFilter] = {}
+        self._snapshot_seq = 0
+
         self._clients: dict[int, ClientConn] = {}
         self._lock = threading.Lock()
         self._next_id = HOST_PLAYER_ID + 1
@@ -83,7 +94,7 @@ class GameHost:
         self._accumulator = 0.0
         self._broadcast_timer = 0.0
         # Sim events pile up here between broadcasts. Ticks run at 60 Hz but
-        # state goes out at 30, so reading state.events at broadcast time would
+        # state goes out at SNAPSHOT_HZ, so reading state.events at broadcast time
         # drop half the jumps and lands on the clients.
         self._event_buffer: list[dict] = []
 
@@ -102,8 +113,42 @@ class GameHost:
                                                name="dinostick-accept")
         self._accept_thread.start()
 
+        if C.USE_UDP_GAMEPLAY:
+            self._start_udp()
+
+    def _start_udp(self) -> None:
+        """Bind the gameplay socket. Failure here is not fatal.
+
+        If the UDP port is taken -- a second host on this machine, or another
+        program squatting on it -- the game still works: with no registered
+        endpoints, snapshots fall back to TCP in ``_send_snapshot``.
+        """
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("", C.PORT_GAME_UDP))
+            sock.settimeout(0.5)
+        except OSError:
+            self._udp = None
+            return
+        self._udp = sock
+        self._udp_thread = threading.Thread(target=self._udp_loop, daemon=True,
+                                            name="dinostick-udp-recv")
+        self._udp_thread.start()
+
     def stop(self) -> None:
         self._stop.set()
+        if self._udp is not None:
+            try:
+                self._udp.close()
+            except OSError:
+                pass
+            self._udp = None
+        if self._udp_thread is not None:
+            self._udp_thread.join(timeout=1.0)
+            self._udp_thread = None
+        self._udp_endpoints.clear()
+        self._input_seq.clear()
         with self._lock:
             clients = list(self._clients.values())
             self._clients.clear()
@@ -171,14 +216,14 @@ class GameHost:
                     # that leaves Wi-Fi mid-run never closes anything, so
                     # without this the connection stays "alive" for minutes and
                     # that player's dino stands still until it kills the team.
-                    if time.monotonic() - client.last_rx > C.CONNECTION_TIMEOUT:
+                    if timing.now() - client.last_rx > C.CONNECTION_TIMEOUT:
                         break
                     continue
                 except OSError:
                     break
                 if not data:
                     break  # peer closed
-                client.last_rx = time.monotonic()
+                client.last_rx = timing.now()
                 try:
                     for msg in reader.feed(data):
                         self._on_message(client, msg)
@@ -186,6 +231,82 @@ class GameHost:
                     break
         finally:
             self._drop(client)
+
+    # -- UDP gameplay stream -------------------------------------------------
+
+    def _udp_loop(self) -> None:
+        """Decode inbound datagrams. Runs on its own thread, touches no widget.
+
+        Deliberately does no work beyond parsing and a dict write: the input
+        table is read by the simulation on the main thread, and a tuple
+        assignment into a dict is atomic under the GIL, so neither side needs
+        a lock and neither can stall the other.
+        """
+        while not self._stop.is_set():
+            sock = self._udp
+            if sock is None:
+                return
+            try:
+                data, addr = sock.recvfrom(2048)
+            except (socket.timeout, TimeoutError):
+                continue
+            except OSError:
+                return
+            msg = protocol.unpack(data)
+            if msg is None:
+                continue
+            kind = msg.get(protocol.TYPE)
+            if kind == protocol.MSG_INPUT:
+                self._on_udp_input(msg, addr)
+            elif kind == protocol.MSG_UDP_REGISTER:
+                self._on_udp_register(msg, addr)
+
+    def _on_udp_register(self, msg: dict[str, Any],
+                         addr: tuple[str, int]) -> None:
+        """Learn where to send this player's snapshots.
+
+        The claimed id is checked against the address that client's TCP
+        connection came from. Two games running on one subnet will happily
+        deliver each other's stray datagrams, and without this a packet from
+        the wrong game could redirect a player's whole snapshot stream.
+        """
+        try:
+            pid = int(msg.get("id", -1))
+        except (TypeError, ValueError):
+            return
+        with self._lock:
+            client = self._clients.get(pid)
+        if client is None or client.addr[0] != addr[0]:
+            return
+        self._udp_endpoints[pid] = addr
+        client.last_rx = timing.now()
+
+    def _on_udp_input(self, msg: dict[str, Any],
+                      addr: tuple[str, int]) -> None:
+        endpoint_owner = None
+        for pid, endpoint in list(self._udp_endpoints.items()):
+            if endpoint == addr:
+                endpoint_owner = pid
+                break
+        if endpoint_owner is None:
+            return  # unregistered sender: ignore rather than trust the packet
+
+        seq_filter = self._input_seq.setdefault(endpoint_owner,
+                                                protocol.SeqFilter())
+        try:
+            seq = int(msg.get("seq", 0))
+        except (TypeError, ValueError):
+            return
+        if not seq_filter.accept(seq):
+            return  # stale or duplicate: the newer input already won
+
+        self._inputs[endpoint_owner] = (bool(msg.get("jump")),
+                                        bool(msg.get("duck")))
+        with self._lock:
+            client = self._clients.get(endpoint_owner)
+        if client is not None:
+            # UDP traffic proves the peer is alive just as well as TCP does.
+            client.last_rx = timing.now()
 
     def _on_message(self, client: ClientConn, msg: dict[str, Any]) -> None:
         """Runs on a socket thread: only touch plain data and the queue."""
@@ -204,6 +325,12 @@ class GameHost:
         if kind == protocol.MSG_JOIN:
             client.name = str(msg.get("name", f"Player {client.id + 1}"))[:16]
             client.skin = int(msg.get("skin", client.id)) % len(C.SKIN_COLORS)
+            # Answer immediately with this client's own id, rather than
+            # waiting for the UI layer to notice the join and push a lobby
+            # update. The id is what the client stamps on its udp_register,
+            # so leaving it to a pump on another thread makes a networking
+            # essential depend on a screen being open.
+            self.send_to(client, protocol.lobby(self.roster(), client.id))
         elif kind == protocol.MSG_READY:
             client.ready = bool(msg.get("ready"))
         elif kind == protocol.MSG_SKIN:
@@ -237,6 +364,41 @@ class GameHost:
                 protocol.send(client.sock, msg)
         except (OSError, ProtocolError):
             self._drop(client)
+
+    def _send_snapshot(self, msg: dict[str, Any]) -> None:
+        """Fan a state snapshot out over UDP, per registered endpoint.
+
+        Anyone who has not registered yet -- the first few frames of a run, or
+        a client whose register packet was lost -- falls back to TCP, so a
+        player is never left staring at a frozen world.
+        """
+        sock = self._udp
+        with self._lock:
+            clients = list(self._clients.values())
+
+        if sock is None or not C.USE_UDP_GAMEPLAY:
+            for client in clients:
+                self.send_to(client, msg)
+            return
+
+        try:
+            payload = protocol.pack(msg)
+        except ProtocolError:
+            # Oversized: too big to fragment safely, so send it reliably
+            # instead of dropping the frame.
+            for client in clients:
+                self.send_to(client, msg)
+            return
+
+        for client in clients:
+            endpoint = self._udp_endpoints.get(client.id)
+            if endpoint is None:
+                self.send_to(client, msg)
+                continue
+            try:
+                sock.sendto(payload, endpoint)
+            except OSError:
+                pass  # a dropped snapshot is replaced next frame; never block
 
     # -- roster -------------------------------------------------------------
 
@@ -292,6 +454,10 @@ class GameHost:
         self._inputs.clear()
         self._accumulator = 0.0
         self._broadcast_timer = 0.0
+        # Sequence numbers restart with the run, so a rematch must not have
+        # last run's counters filtering out this run's first packets.
+        self._snapshot_seq = 0
+        self._input_seq.clear()
         self.running = True
         self.broadcast(protocol.start(self.seed, entries))
 
@@ -325,6 +491,16 @@ class GameHost:
         if ticks == C.MAX_TICKS_PER_FRAME:
             self._accumulator = 0.0
 
+        # Crashes go out over TCP the moment they happen, ahead of the
+        # snapshot that reports the aftermath. Everything else is cosmetic
+        # enough to ride in the snapshot and be missed occasionally; a crash
+        # with no sound, no shake and no particles just looks like a bug.
+        fatal = [e for e in self._event_buffer if e.get("e") == "crash"]
+        if fatal:
+            self._event_buffer = [e for e in self._event_buffer
+                                  if e.get("e") != "crash"]
+            self.broadcast(protocol.events(fatal))
+
         state = self.sim.state
         if not state.running:
             self.running = False
@@ -333,14 +509,16 @@ class GameHost:
                 state.cause_player_id, state.cause_obstacle))
             return
 
-        # State goes out at STATE_BROADCAST_HZ, not every physics tick -- 60 Hz
-        # of full snapshots is bandwidth we do not need on a LAN.
+        # State goes out at SNAPSHOT_HZ, not every physics tick -- 60 Hz of
+        # full snapshots is bandwidth we do not need on a LAN.
         self._broadcast_timer += frame_dt
-        interval = 1.0 / C.STATE_BROADCAST_HZ
+        interval = 1.0 / C.SNAPSHOT_HZ
         if self._broadcast_timer >= interval:
             self._broadcast_timer = 0.0
+            self._snapshot_seq += 1
             msg = state_to_snapshot(state)
             msg[protocol.TYPE] = protocol.MSG_STATE
+            msg["seq"] = self._snapshot_seq
             msg["events"] = self._event_buffer
             self._event_buffer = []
-            self.broadcast(msg)
+            self._send_snapshot(msg)

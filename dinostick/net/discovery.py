@@ -16,10 +16,10 @@ import os
 import queue
 import socket
 import threading
-import time
 from typing import Any
 
 from game import constants as C
+from game import timing
 
 from . import protocol
 
@@ -248,7 +248,7 @@ class ClientDiscovery:
                 "port": int(msg.get("game_port", C.PORT_GAME)),
                 "players": int(msg.get("players", 1)),
                 "max": int(msg.get("max", C.MAX_PLAYERS)),
-                "seen_at": time.monotonic(),
+                "seen_at": timing.now(),
             }
             with self._lock:
                 self._seen[record["ip"]] = record
@@ -256,7 +256,7 @@ class ClientDiscovery:
 
     def hosts(self) -> list[dict[str, Any]]:
         """Hosts heard from recently, newest announcement first."""
-        now = time.monotonic()
+        now = timing.now()
         with self._lock:
             fresh = [h for h in self._seen.values()
                      if now - h["seen_at"] <= C.DISCOVERY_TIMEOUT]

@@ -12,6 +12,27 @@ from .entities import GameState, Modifiers, Player
 from .world import World
 
 
+def modifiers_for(effects: dict[str, float]) -> Modifiers:
+    """Collapse active effects into the multipliers physics reads.
+
+    Module-level and pure so the client's prediction can ask the same question
+    the host does. Duplicating this rule client-side would mean prediction and
+    authority quietly disagreeing about what Feather does to gravity, which
+    shows up as the local dino drifting only while a power-up is active --
+    about the worst class of bug to track down.
+    """
+    mods = Modifiers()
+    if C.POWERUP_SLOWMO in effects:
+        mods.speed_scale = C.SLOWMO_SPEED_SCALE
+    if C.POWERUP_FEATHER in effects:
+        mods.gravity_scale = C.FEATHER_GRAVITY_SCALE
+        mods.rope_scale = C.FEATHER_ROPE_SCALE
+    if C.POWERUP_SYNC in effects:
+        # Sync wins outright: the rope goes completely slack.
+        mods.rope_scale = 0.0
+    return mods
+
+
 def make_players(count: int, names: list[str] | None = None,
                  skins: list[int] | None = None) -> list[Player]:
     """Build a roster laid out left->right at evenly spaced fixed x offsets."""
@@ -50,17 +71,7 @@ class Simulation:
 
     def modifiers(self) -> Modifiers:
         """Collapse the active effects into the multipliers physics reads."""
-        effects = self.state.effects
-        mods = Modifiers()
-        if C.POWERUP_SLOWMO in effects:
-            mods.speed_scale = C.SLOWMO_SPEED_SCALE
-        if C.POWERUP_FEATHER in effects:
-            mods.gravity_scale = C.FEATHER_GRAVITY_SCALE
-            mods.rope_scale = C.FEATHER_ROPE_SCALE
-        if C.POWERUP_SYNC in effects:
-            # Sync wins outright: the rope goes completely slack.
-            mods.rope_scale = 0.0
-        return mods
+        return modifiers_for(self.state.effects)
 
     def _tick_effects(self, dt: float) -> None:
         expired = []

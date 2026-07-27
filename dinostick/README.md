@@ -4,7 +4,7 @@ A local-multiplayer co-op endless runner. 2–4 dinos, all tied together by an
 elastic rope. The rope exerts real spring forces, so jumping out of sync drags
 your teammates. If any one player crashes, **everyone** loses.
 
-LAN only — UDP broadcast for discovery, direct TCP for game traffic. No
+LAN only — UDP broadcast for discovery, TCP for control, UDP for gameplay. No
 servers, no accounts.
 
 ## Status
@@ -160,6 +160,196 @@ Input is the one exception to the queue rule: `input` messages are written
 straight into a plain dict on the host (`{player_id: (jump, duck)}`), latest
 wins. A tuple assignment into a dict is atomic under the GIL, and it keeps a
 60 Hz-per-client message stream out of the queue entirely.
+
+### Two transports, on purpose
+
+| | TCP `PORT_GAME` (50506) | UDP `PORT_GAME_UDP` (50507) |
+|---|---|---|
+| carries | join, lobby, ready, skin, `start`, `gameover`, `rematch`, crash events | `input`, `state` snapshots |
+| rate | a handful per run | `INPUT_HZ` 60 up, `SNAPSHOT_HZ` 60 down |
+| if a packet is lost | retransmit — it matters | skip it — a newer one is 16 ms away |
+
+The split exists because of **head-of-line blocking**. TCP guarantees order, so
+one lost snapshot stalls every snapshot queued behind it until the retransmit
+lands about an RTT later. For a stream where each packet makes its predecessors
+irrelevant, waiting is strictly worse than skipping: the game freezes in order
+to redeliver a frame nobody wants any more. That is the lag spike.
+
+Control messages are the exact opposite — rare, and each one unique — so they
+stay on TCP, and the TCP connection doubles as the liveness signal.
+
+Consequences worth knowing:
+
+- **Every gameplay packet carries a `seq`.** Receivers keep `last_seq` and drop
+  anything not newer (`protocol.SeqFilter`), so reordered and duplicated
+  datagrams are discarded rather than rendered backwards. Nothing ever waits
+  for a gap to be filled.
+- **Input is resent at `INPUT_HZ`, not sent on change.** Over TCP a keypress
+  was one reliable message; over UDP that dropped packet is a jump the host
+  never hears about. Resending is the reliability mechanism, and it is safe
+  because the host detects a rising edge per tick — a repeated `jump:true`
+  cannot produce a second hop.
+- **UDP is connectionless, so the host must be told where to reply.** On
+  `start`, each client sends `udp_register` with its player id; the host
+  records the source address and `sendto()`s snapshots there. That single
+  datagram can be lost, so clients re-announce every `UDP_REGISTER_INTERVAL`
+  until the first snapshot arrives. The claimed id is checked against the
+  address that client's TCP connection came from, so a stray packet from
+  another game on the same subnet cannot redirect someone's stream.
+- **Crashes go over TCP, everything else rides in the snapshot.** Jump and
+  land thuds are cosmetic enough to miss occasionally; a crash with no sound,
+  no shake and no particles reads as a bug. The host strips crash events out
+  of the snapshot and sends them reliably, so they can never fire twice.
+- **Snapshots fit in one datagram.** Measured worst case — 4 players, 4
+  obstacles, 3 power-ups, every effect active — is 936 bytes against a
+  `MAX_DATAGRAM_BYTES` ceiling of 1200, so nothing fragments. Oversized
+  packets fall back to TCP rather than being dropped.
+- **`USE_UDP_GAMEPLAY`** flips the whole thing back to the all-TCP path, which
+  is kept working. The same fallback engages per-client whenever an endpoint
+  has not registered yet.
+
+### Entity interpolation
+
+Snapshots arrive 40 times a second at best and unevenly at worst; the screen
+redraws 60+ times a second. Drawing the newest snapshot the instant it lands
+means the world lurches on arrival and freezes in between.
+
+So clients render the world at `now - INTERP_DELAY_MS` (100 ms). At any moment
+there is almost always a snapshot on each side of the instant being drawn, so
+positions are linearly interpolated between the two — players matched by `id`,
+obstacles by `oid`, power-ups by `pid`. Anything present in only one of the
+pair is taken as-is, which stops obstacles sliding in from the wrong place as
+they spawn and despawn.
+
+The delay is the entire trade-off: too low and a late packet leaves nothing to
+interpolate toward; too high and everyone is visibly behind where they really
+are. 100 ms absorbs four consecutive dropped snapshots at `SNAPSHOT_HZ`.
+`SNAPSHOT_BUFFER` of 12 holds 300 ms of history, so the bracketing pair is
+always still there.
+
+**The local player is excluded** (`interpolate(..., skip_ids=)`). Interpolation
+renders the past, and the past is the one place your own dino must never be —
+you press jump and expect to leave the ground *now*. That player is drawn from
+client-side prediction instead.
+
+Measured under 10% packet loss and heavy arrival jitter: **0% frozen frames**,
+blend factor sweeping the full 0→1, no backwards motion.
+
+### Client-side prediction
+
+Interpolation renders the past, which is right for everyone except you.
+Pressing jump and watching your own dino leave the ground a round trip later
+is the most noticeable flaw a networked action game can have — you *feel*
+your own input in a way you never feel a partner being 100 ms behind.
+
+So the local dino is simulated on the client the instant input is read
+(`game/prediction.py`), and the host's later word arrives as a correction
+rather than as news. Measured: **0 frames** from press to visible motion,
+against ~6 frames (106 ms) unpredicted on a 6 ms LAN.
+
+Two things make it accurate:
+
+- **It reuses the host's own functions** — `apply_player_forces` then
+  `integrate_and_clamp`, the same two calls `Simulation.step` makes, with the
+  rope step between them simply skipped. Verified to reproduce the host's jump
+  arc to **0.00e+00 px** over a full second. A reimplementation would drift
+  the moment either function was touched.
+- **It steps in fixed `TICK_DT` slices**, not by frame time. Gravity is
+  integrated with Euler, whose result depends on `dt`, so stepping by a
+  variable frame time traces a subtly different arc — a systematic drift that
+  reconciliation would then fight every frame.
+
+**The rope is deliberately not predicted.** It couples you to neighbours whose
+inputs this device does not have; guessing them produces confident, wrong
+motion that has to be yanked back. So being ripped off the floor by a partner
+always arrives as a correction — which is exactly what reconciliation is for.
+
+Corrections are eased in at `RECONCILE_LERP` (a fifth of the error per frame,
+converging in ~10 frames) unless the error exceeds `RECONCILE_SNAP` (120 px,
+over half a jump's peak), where easing would be dishonest and it snaps. A
+77 px rope yank eases in at **15 px/frame worst case** — no teleporting.
+
+#### Reconciling against a moving target
+
+A snapshot describes the past: by the time it is decoded it is a packet's
+flight plus up to a snapshot interval old. Reconciling against that raw value
+drags the prediction toward a stale position every frame — measured at
+**44.5 px behind the truth at the peak of a jump**, most of a dino's height,
+enough to make you look like you cleared a cactus you actually hit.
+
+So the sample is first rolled forward by its own age with the same integrator
+(`LocalPredictor._catch_up`) before being compared. That drops the steady-state
+offset to **0.0 px** and leaves reconciliation doing only what it should:
+correcting what prediction genuinely could not know.
+
+### Tuning, and how the numbers were chosen
+
+Every constant here was picked from a measurement, not by feel. The rigs live
+outside the repo, but they are all reproducible from `select_pair` and
+`LocalPredictor`, which are pure and take no Kivy.
+
+**Snapshot rate vs interpolation delay.** Swept over 20-second runs at 60 fps
+against three synthetic networks. The surprise: raising the *rate* buys more
+than raising the *delay*, because a dropped packet leaves a gap one interval
+wide, and the delay only has to cover the worst gap — so a faster stream needs
+a shorter delay to ride out the same loss.
+
+| bad Wi-Fi (1.2× jitter, 10% loss) | stalls | mean lag |
+|---|---|---|
+| 40 Hz / 100 ms | 0.17% | 122 ms |
+| **60 Hz / 66 ms** | **0.17%** | **81 ms** |
+| 60 Hz / 50 ms | 0.59% | 65 ms |
+
+Same smoothness, 41 ms closer to the truth. 50 ms is where it starts to break
+down. Cost is ~165 KB/s upstream to three clients — nothing on a LAN.
+
+**`RECONCILE_LERP`.** Measured against a 77 px rope yank at 60 fps. 0.10 leaves
+your dino drawn in the wrong place for 417 ms; 0.30 moves it a third of a body
+height in one frame. 0.20 is the knee: 15 px worst step, settled in 200 ms.
+
+**Packet loss.** `SIMULATED_PACKET_LOSS` (ships at 0.0) drops inbound gameplay
+datagrams on purpose in the client's receive thread. Measured through real
+sockets, tracking a scrolling obstacle — the dominant motion on screen, and
+interpolated rather than predicted:
+
+| induced loss | frames held | frames lurching |
+|---|---|---|
+| 0% | 0.9% | **0%** |
+| 5% | 1.1% | **0%** |
+| 10% | 0.0% | **0%** |
+| 30% | 2.2% | **0%** |
+
+The lurch count is the one that matters: a lurch means the view gave up
+interpolating and snapped, which is the TCP-era stutter. It stays at zero even
+at 30% loss — triple anything realistic — where the stream simply holds a
+frame now and then. Losing packets costs smoothness, never time.
+
+*(Measuring this correctly took two attempts. The first version tracked a
+dino's height and reported ~44% "frozen" frames at every loss level — a number
+completely insensitive to the variable under test, which is the tell. It was
+counting a dino standing still on the ground as a stutter.)*
+
+### One clock, and why it is `perf_counter`
+
+Everything that measures elapsed time goes through `game/timing.py`, which is
+`time.perf_counter` — never `time.monotonic`.
+
+The two look interchangeable. On Windows (CPython ≤ 3.12) `monotonic` is
+`GetTickCount64`, whose resolution is the scheduler tick, about **15.6 ms**;
+measured here it did not advance once across 2000 consecutive calls, while
+`perf_counter` resolved to 0.1 µs.
+
+That is invisible for a six-second timeout and ruinous at frame scale. With
+interpolation on a 15.6 ms clock, both the render target and the snapshot
+arrival stamps snapped to the same grid, so the blend factor jumped in steps
+instead of sweeping — **a third of rendered frames showed no movement at all**,
+precisely the stutter interpolation exists to remove. The same granularity
+made a 1–3 ms LAN round trip read as either 0 ms or 15.6 ms, so the
+connection-quality HUD was meaningless.
+
+The epoch is arbitrary and differs from `monotonic`'s, so the rule is
+consistency: every value that gets compared or subtracted must come from
+`timing.now()`. Mixing the two silently breaks both timeouts and interpolation.
 
 ## Characters
 
