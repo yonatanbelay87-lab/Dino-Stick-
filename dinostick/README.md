@@ -137,7 +137,7 @@ Six obstacle types, faded in as the run gets faster: small/large cactus,
 cactus cluster, boulder, and birds at two heights. The bird heights are picked
 against the measured jump apexes, so "duck" genuinely means duck:
 
-| | occupies | standing (0–60) | ducking (0–32) | jump over it? |
+| | occupies | standing (0–81) | ducking (0–42) | jump over it? |
 |---|---|---|---|---|
 | `BIRD_LOW` | 26–60 | hit | hit | **must jump** (clears at 60) |
 | `BIRD_HIGH` | 46–86 | hit | safe | solo jump (83) fails, synced (196) clears |
@@ -145,10 +145,22 @@ against the measured jump apexes, so "duck" genuinely means duck:
 Ducking needs both feet on the ground — so a bird arriving while the rope has
 you airborne is lethal. That is the point.
 
+`BIRD_HIGH`'s underside at 46 is what caps how big the characters can get: the
+ducking box has to stay below it or ducking stops being an answer. At 42 there
+is 4px of daylight left.
+
 Power-ups are team-wide and float at 70–160px, above a solo jump, so
 collecting the good ones is itself a reason to coordinate. Shield absorbs one
 fatal hit for everyone; Slow-mo, Feather (low gravity + slack rope) and Sync
 (rope fully slack) are timed; Star is a score bonus.
+
+Each one carries an **icon** — shield crest, hourglass, up arrow, two
+interlocking links, star — because colour alone only works once you have
+memorised the palette. They are drawn from `POWERUP_ICONS`, in the same
+normalised-parts idiom as the characters, so an icon cannot escape its disc
+and the set rescales with `POWERUP_SIZE`. The ink is picked per disc by
+brightness, which is what stops the yellow Star getting a white icon nobody
+can read.
 
 ### The fairness invariant
 
@@ -407,6 +419,15 @@ that two runs with different characters produce byte-identical simulations.
 
 Ducking needs no separate art: the hitbox itself shrinks to
 `PLAYER_DUCK_HEIGHT`, so the whole silhouette squashes with it.
+
+The box is **60 × 81** — scaled up about 35% from the original 44 × 60 when the
+painted seasons went in, because a 60px dino that read fine against a plain
+background read as an ant beside a 200px palm tree. Because the art is
+normalised, that was three numbers and no art. Standing height is nearly free
+(a grounded dino already overlaps everything that can reach it, and clearing an
+obstacle is decided by where its feet are); the width costs a little timing —
+worst case `BIRD_HIGH`, where the leeway on a solo jump goes from 0.501s to
+0.487s at `MAX_SPEED`, a 2.9% trim.
 
 To add a character, append one entry to `SKINS` — a name, a colour, a list of
 parts (`rect`, `ellipse` or `tri`) and an eye position. Nothing else changes.

@@ -280,15 +280,81 @@ class Renderer:
              width=C.GROUND_LINE_WIDTH * s)
 
     def _draw_powerup(self, powerup) -> None:
+        """A coloured disc with an icon on it, ringed for contrast.
+
+        The old white highlight dot was the only marking, which made every
+        power-up the same object in a different colour -- fine once you had
+        memorised the palette, useless before that. The icon says what it is;
+        the colour still says which one at a glance.
+        """
         color = C.POWERUP_COLORS.get(powerup.kind, C.COLOR_ACCENT)
         w, h = C.POWERUP_SIZE
+        ring = C.POWERUP_RING
+
+        # Outline first, drawn as a slightly larger disc behind the real one.
+        # A flat disc of colour alone sank into the painted seasons.
+        Color(*_shade(color, 0.55))
+        pos, size = self._place(powerup.x - ring, powerup.y - ring,
+                                w + ring * 2.0, h + ring * 2.0)
+        Ellipse(pos=pos, size=size)
+
         Color(*color)
         pos, size = self._place(powerup.x, powerup.y, w, h)
         Ellipse(pos=pos, size=size)
-        Color(1, 1, 1, 0.85)
-        pos, size = self._place(powerup.x + w * 0.3, powerup.y + h * 0.3,
-                                w * 0.4, h * 0.4)
-        Ellipse(pos=pos, size=size)
+
+        # Ink chosen against the disc, so the yellow Star does not get a white
+        # icon on it that nobody can read.
+        luma = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2]
+        Color(*(C.COLOR_ICON_DARK if luma > C.ICON_DARK_ABOVE
+                else C.COLOR_ICON_LIGHT))
+        for part in C.POWERUP_ICONS.get(powerup.kind, ()):
+            self._draw_icon(part, powerup.x, powerup.y, w, h)
+
+    def _draw_icon(self, part: dict, ox: float, oy: float,
+                   w: float, h: float) -> None:
+        """One icon primitive, in coordinates normalised to a (w, h) box."""
+        kind = part["k"]
+        if kind == "tri":
+            p = part["p"]
+            points: list[float] = []
+            for i in range(0, 6, 2):
+                pos, _ = self._place(ox + p[i] * w, oy + p[i + 1] * h, 0.0, 0.0)
+                points.extend(pos)
+            Triangle(points=points)
+        elif kind == "ring":
+            cx, cy, radius, stroke = part["c"]
+            pos, _ = self._place(ox + cx * w, oy + cy * h, 0.0, 0.0)
+            scale = self._scale()
+            Line(circle=(pos[0], pos[1], radius * w * scale),
+                 width=max(1.0, stroke * w * scale))
+        elif kind == "star":
+            cx, cy, outer, inner, spikes = part["s"]
+            pos, _ = self._place(ox + cx * w, oy + cy * h, 0.0, 0.0)
+            self._draw_star(pos, outer * w * self._scale(),
+                            inner * w * self._scale(), int(spikes))
+        else:
+            x, y, pw, ph = part["r"]
+            pos, size = self._place(ox + x * w, oy + y * h, pw * w, ph * h)
+            (Ellipse if kind == "ellipse" else Rectangle)(pos=pos, size=size)
+
+    @staticmethod
+    def _draw_star(centre: tuple[float, float], outer: float, inner: float,
+                   spikes: int) -> None:
+        """A filled star, as a fan of triangles around its centre.
+
+        Kivy has no filled-polygon instruction, so the shape is built from
+        Triangles -- one per edge of the star's outline.
+        """
+        points = []
+        for i in range(spikes * 2):
+            radius = outer if i % 2 == 0 else inner
+            angle = math.pi * 0.5 + i * math.pi / spikes  # first spike points up
+            points.append((centre[0] + radius * math.cos(angle),
+                           centre[1] + radius * math.sin(angle)))
+        for i, point in enumerate(points):
+            nxt = points[(i + 1) % len(points)]
+            Triangle(points=[centre[0], centre[1], point[0], point[1],
+                             nxt[0], nxt[1]])
 
     def _draw_rope(self, state: GameState) -> None:
         """Draw each rope segment, sagging when slack and taut when stretched."""
@@ -352,8 +418,10 @@ class Renderer:
 
         # A shield covers the whole team, so ring every dino.
         if state.shield:
+            pad = C.SHIELD_RING_PAD
             Color(*C.POWERUP_COLORS[C.POWERUP_SHIELD])
-            pos, size = self._place(box.x - 6, box.y - 6, box.w + 12, box.h + 12)
+            pos, size = self._place(box.x - pad, box.y - pad,
+                                    box.w + pad * 2.0, box.h + pad * 2.0)
             Line(rectangle=(pos[0], pos[1], size[0], size[1]), width=1.6)
 
         # Eye, placed per character; they all face right, into the obstacles.

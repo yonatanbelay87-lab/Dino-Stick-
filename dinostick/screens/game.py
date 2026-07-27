@@ -59,6 +59,8 @@ class GameView(Widget):
 
     def on_touch_down(self, touch):
         if self.mapper is not None and self.collide_point(*touch.pos):
+
+            
             if self.mapper.touch_down(touch.uid, touch.x - self.x,
                                       touch.y - self.y, self.width, self.height):
                 return True

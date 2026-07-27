@@ -55,9 +55,29 @@ DUCK_FALL_MULTIPLIER: Final[float] = 2.2
 JUMP_AIR_TIME: Final[float] = 2.0 * JUMP_VELOCITY / abs(GRAVITY)  # ~0.79 s
 JUMP_PEAK_HEIGHT: Final[float] = JUMP_VELOCITY**2 / (2.0 * abs(GRAVITY))  # ~188 px
 
-PLAYER_WIDTH: Final[float] = 44.0
-PLAYER_HEIGHT: Final[float] = 60.0
-PLAYER_DUCK_HEIGHT: Final[float] = 32.0
+# The box every character occupies, and the only thing they collide with.
+#
+# Scaled up ~35% from the original 44 x 60 once the painted seasons went in
+# behind them: against a plain background a 60px dino read fine, but next to
+# 200px palm trees it read as an ant. Everything about a character is
+# normalised to this box (see SKINS), so these three numbers are the whole
+# change -- no art was touched.
+#
+# Standing height is close to free: a grounded dino already overlaps every
+# obstacle that can reach it, and clearing one is decided by where its FEET
+# are, so making it taller changes no collision. The ceiling is on the DUCK
+# height, which has to stay under BIRD_HIGH's underside at y=46 or ducking
+# stops being an answer to it. 42 keeps 4px of daylight; much past that and
+# the bird geometry in OBSTACLE_Y has to be retuned with it.
+#
+# Width is the one that costs anything at all: a wider dino overlaps an
+# obstacle's x-span for longer, so the window of jump timings that survive
+# gets narrower. Measured against every obstacle at MAX_SPEED, the worst case
+# is BIRD_HIGH at -2.9% (0.501s of leeway down to 0.487s), and the jump arc
+# is so much longer than the overlap that nothing comes close to unclearable.
+PLAYER_WIDTH: Final[float] = 60.0
+PLAYER_HEIGHT: Final[float] = 81.0
+PLAYER_DUCK_HEIGHT: Final[float] = 42.0
 
 # Fixed on-screen x positions: players are evenly spaced left->right.
 PLAYER_START_X: Final[float] = 140.0
@@ -179,7 +199,7 @@ OBSTACLE_SIZES: Final[dict[str, tuple[float, float]]] = {
 # The two bird heights are chosen against the jump apexes measured in Phase 2,
 # because "duck under this" only means anything if jumping is a bad idea:
 #
-#   dino standing = 0..60      dino ducking = 0..32
+#   dino standing = 0..81      dino ducking = 0..42
 #   solo jump apex = 83        perfectly synced jump apex = 196
 #
 #   BIRD_LOW  occupies 26..60 -> hits you standing AND ducking, so you must
@@ -292,6 +312,62 @@ POWERUP_COLORS: Final[dict[str, tuple[float, float, float, float]]] = {
     POWERUP_SYNC: (0.92, 0.62, 0.20, 1.0),
     POWERUP_STAR: (0.94, 0.78, 0.20, 1.0),
 }
+
+# An icon on each disc, so what you are about to grab is readable at a glance
+# instead of being a colour you have to have memorised. Colour still carries
+# the meaning; the icon is what makes it learnable.
+#
+# Same idiom as the characters: parts in coordinates NORMALISED to the
+# power-up's box, so an icon cannot drift out of its disc and the whole set
+# rescales with POWERUP_SIZE. Kinds:
+#
+#   rect / ellipse   "r": [x, y, w, h]
+#   tri              "p": [x1, y1, x2, y2, x3, y3]
+#   ring             "c": [centre x, centre y, radius, stroke width]
+#   star             "s": [centre x, centre y, outer r, inner r, points]
+#
+# Drawn in one ink colour picked for contrast against the disc -- see
+# Renderer._draw_powerup -- so nothing here names a colour.
+POWERUP_ICONS: Final[dict[str, tuple[dict, ...]]] = {
+    # A crest: flat shoulders tapering to a point.
+    POWERUP_SHIELD: (
+        {"k": "rect", "r": [0.30, 0.46, 0.40, 0.26]},
+        {"k": "tri", "p": [0.30, 0.46, 0.70, 0.46, 0.50, 0.22]},
+    ),
+    # An hourglass -- time, which is what slow-mo actually buys you.
+    POWERUP_SLOWMO: (
+        {"k": "tri", "p": [0.32, 0.72, 0.68, 0.72, 0.50, 0.50]},
+        {"k": "tri", "p": [0.32, 0.28, 0.68, 0.28, 0.50, 0.50]},
+        {"k": "rect", "r": [0.28, 0.72, 0.44, 0.06]},
+        {"k": "rect", "r": [0.28, 0.22, 0.44, 0.06]},
+    ),
+    # An up arrow. A literal feather is unreadable at 34px; "you go up" is
+    # the effect anyway.
+    POWERUP_FEATHER: (
+        {"k": "tri", "p": [0.26, 0.52, 0.74, 0.52, 0.50, 0.80]},
+        {"k": "rect", "r": [0.43, 0.20, 0.14, 0.34]},
+    ),
+    # Two interlocking links -- the rope, and the two of you on it. The stroke
+    # has to stay well under the radius or the links fill in and read as a
+    # pair of dots.
+    POWERUP_SYNC: (
+        {"k": "ring", "c": [0.33, 0.50, 0.20, 0.045]},
+        {"k": "ring", "c": [0.67, 0.50, 0.20, 0.045]},
+    ),
+    POWERUP_STAR: (
+        {"k": "star", "s": [0.50, 0.50, 0.42, 0.175, 5]},
+    ),
+}
+
+# Ring drawn around a power-up disc, in design px. A flat disc of colour
+# vanished into the painted seasons; a darker outline pins it to the front.
+POWERUP_RING: Final[float] = 2.5
+
+# Icon ink. Which one is used is decided by the disc's brightness, so the
+# yellow Star does not end up with a white icon on it.
+COLOR_ICON_LIGHT: Final[tuple[float, float, float, float]] = (1.0, 1.0, 1.0, 0.95)
+COLOR_ICON_DARK: Final[tuple[float, float, float, float]] = (0.16, 0.14, 0.10, 0.95)
+ICON_DARK_ABOVE: Final[float] = 0.62  # perceived luminance of the disc
 
 # ---------------------------------------------------------------------------
 # Input
@@ -517,7 +593,8 @@ GROUND_Y: Final[float] = 140.0  # design-space y of the ground line
 VIEW_MIN_HEIGHT: Final[float] = 520.0
 
 GROUND_LINE_WIDTH: Final[float] = 2.0
-EYE_SIZE: Final[float] = 6.0
+EYE_SIZE: Final[float] = 8.0  # scales with the character box, not with it
+SHIELD_RING_PAD: Final[float] = 8.0  # gap between a dino and its shield ring
 
 # The sim counts pixels; players do not think in pixels. Everything shown to a
 # human is converted through this, so the HUD reads "620 m" and "32 km/h"
