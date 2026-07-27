@@ -213,6 +213,8 @@ class GameScreen(Screen):
         self._teardown()
         app = App.get_running_app()
         self._mode = app.mode if app else "local"
+        # Last run's screen shake, particles and season are not this run's.
+        self.renderer.reset()
 
         touch_device = platform in ("android", "ios")
 

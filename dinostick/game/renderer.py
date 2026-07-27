@@ -25,6 +25,7 @@ from kivy.graphics import (Color, Ellipse, Line, PopMatrix, PushMatrix,
                            Rectangle, Translate, Triangle)
 
 from . import constants as C
+from .backdrop import Backdrop
 from .entities import GameState, Player
 from .physics import rope_tension
 
@@ -60,6 +61,21 @@ class Renderer:
         self._shake = 0.0
         self._prev_tension = 0.0
         self._scroll = 0.0  # parallax offset, advanced from world speed
+        self.backdrop = Backdrop()
+        # Metres run, smoothed -- see advance(). Drives the season strip.
+        self._bg_metres = 0.0
+        # Decode the opening season now rather than on the first frame of the
+        # first run: this object is built while the menu is still up.
+        self.backdrop.warm(0.0)
+
+    def reset(self) -> None:
+        """Drop everything carried over from the previous run."""
+        self._particles.clear()
+        self._shake = 0.0
+        self._prev_tension = 0.0
+        self._scroll = 0.0
+        self._bg_metres = 0.0
+        self.backdrop.warm(0.0)
 
     # -- juice hooks --------------------------------------------------------
 
@@ -74,6 +90,7 @@ class Renderer:
     def advance(self, dt: float, state: GameState) -> None:
         """Step the presentation-only animation. Call once per rendered frame."""
         self._scroll += state.speed * dt
+        self._advance_backdrop(dt, state)
 
         if self._shake > 0.0:
             self._shake = max(0.0, self._shake - dt)
@@ -99,6 +116,30 @@ class Renderer:
                 and self._prev_tension < C.SHAKE_TENSION_TRIGGER):
             self.shake(0.6)
         self._prev_tension = tension
+
+    def _advance_backdrop(self, dt: float, state: GameState) -> None:
+        """Track ``state.distance`` in metres, smoothly.
+
+        The season strip could read state.distance directly, and in local and
+        host mode that would be the end of it. A client cannot: its distance
+        arrives in snapshot-rate steps, and scenery that only moves ~20 times a
+        second next to obstacles interpolated every frame reads as a judder in
+        the background of an otherwise smooth game.
+
+        So the count is advanced locally at the world speed -- which every mode
+        already has, every frame -- and continuously eased back onto the
+        authoritative figure. A gap too big to be lag (a new run, a rematch, a
+        client dropping into a run already in progress) is taken in one jump
+        instead, because easing across half a kilometre would scroll the whole
+        cycle past at a ludicrous speed.
+        """
+        target = state.distance / C.PIXELS_PER_METRE
+        if abs(target - self._bg_metres) > C.BG_RESYNC_METRES:
+            self._bg_metres = target
+            return
+        self._bg_metres += state.speed * dt / C.PIXELS_PER_METRE
+        self._bg_metres += ((target - self._bg_metres)
+                            * min(1.0, C.BG_CORRECT_RATE * dt))
 
     # -- design space -> widget space ---------------------------------------
 
@@ -155,7 +196,11 @@ class Renderer:
             PushMatrix()
             Translate(offset[0], offset[1], 0)
 
-            self._draw_parallax()
+            # The painted seasons are the background; the old hills stay on as
+            # the fallback for the frames before an image has decoded (and for
+            # a build with the art missing entirely).
+            if not self._draw_backdrop():
+                self._draw_parallax()
             self._draw_ground()
 
             for powerup in state.powerups:
@@ -175,6 +220,31 @@ class Renderer:
             self._draw_particles()
 
             PopMatrix()
+
+    def _draw_backdrop(self) -> bool:
+        """Draw the season strip. False if there was nothing ready to draw.
+
+        All the placement lives in backdrop.tiles(); this only maps the result
+        into widget space and hands it to the canvas.
+        """
+        scale = self._scale()
+        if scale <= 0.0:
+            return False
+        left, right = self._visible_x()
+        view_top = self.widget.height / scale - C.GROUND_Y
+        tiles = self.backdrop.tiles(self._bg_metres, left, right, view_top)
+        if not tiles:
+            return False
+
+        Color(1, 1, 1, 1)  # untinted: whatever colour ran before is not ours
+        for texture, x, y, w, h in tiles:
+            pos, size = self._place(x, y, w, h)
+            # A hair wider than exact. Neighbouring copies land on fractional
+            # pixels, and without the overlap the rounding shows up as a
+            # flickering one-pixel gap of sky between them.
+            Rectangle(pos=pos, size=(size[0] + 1.0, size[1]),
+                      texture=texture)
+        return True
 
     def _draw_parallax(self) -> None:
         """Rolling hills at fractional scroll speeds, for depth.

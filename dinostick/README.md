@@ -175,8 +175,8 @@ explain why.
 - **Thread safety** — sockets live on background threads and push decoded
   messages into `queue.Queue`. Kivy widgets are only ever touched on the main
   thread, from the `Clock` loop.
-- `net/` imports nothing from Kivy; `game/` (except `renderer.py` and
-  `game_input.py`) is pure Python and testable headless.
+- `net/` imports nothing from Kivy; `game/` (except `renderer.py`,
+  `backdrop.py` and `game_input.py`) is pure Python and testable headless.
 
 Every tunable — physics, rope constants, ports, timings, colours — lives in
 `game/constants.py`.
@@ -410,6 +410,54 @@ Ducking needs no separate art: the hitbox itself shrinks to
 
 To add a character, append one entry to `SKINS` — a name, a colour, a list of
 parts (`rect`, `ellipse` or `tri`) and an eye position. Nothing else changes.
+
+## Seasons
+
+The background is eight painted seasons that the team runs *through*, from
+`assets/Dino-Stick BG pics/`. Each season holds for **500 m**, tiling
+seamlessly as it scrolls right to left, and then a transition image — the ones
+with a `T` in the name — makes a **single** pass to hand over to the next:
+
+```
+1-Start  →1T2→  2-Rainy  →2T3→  3-Snowy  →3T4→  4-Mid  →4T5→
+5-Desert →5T6→  6-Astroid →6T7→ 7-Ashy   →7T8→  8-Grassland →8T1→ (wraps)
+```
+
+That is 4,800 m of scenery per lap: 8 × 500 m of season plus 8 × 100 m of
+transition. Nothing fades or cuts between them — the transition art already
+paints one season into the next, so scrolling through it *is* the transition.
+
+`game/backdrop.py` lays all of it out as one endless strip and reads from it at
+whatever point the team has reached. The layout is a **pure function of
+distance**, which is what makes the progression work identically in all three
+modes for nothing: local, host and client all know `state.distance` already, so
+all three land on the same season at the same metre mark without a byte of it
+going on the wire. There is no scroll accumulator to drift, nothing to reset
+between runs, and a mid-run window resize simply re-lays the strip in the right
+place instead of tearing.
+
+Three details that are less obvious than they look:
+
+- **Seasons snap to whole copies.** The number of copies in 500 m is rounded,
+  and the effective parallax absorbs the few percent of error. Spacing them at
+  an exact `BG_PARALLAX` instead leaves the last copy cut off mid-image where
+  the transition begins, which reads as a tear across the sky.
+- **Every image is dropped onto the ground line individually.** The painted
+  ground sits at a different height in each one (`BG_GROUND_FRACTIONS`,
+  measured off the art — the rainy waterline is a good 5% of the image lower
+  than the jungle's grass). One shared value left a visible step in the ground
+  at every seam. The *height* is still shared, or the world would zoom in and
+  out by a third from one season to the next.
+- **The renderer scrolls on its own smoothed metre count.** A client's distance
+  arrives in ~20 Hz steps, and scenery moving at snapshot rate next to
+  obstacles interpolated every frame reads as a judder. So it advances locally
+  at the world speed and eases onto the authoritative figure, jumping only when
+  the gap is too big to be lag (a new run, or joining one in progress).
+
+Loading is asynchronous, lazy and capped at `BG_CACHE` textures, with the next
+image warmed `BG_PREFETCH_METRES` ahead. A missing or still-decoding image is
+simply not drawn and the renderer falls back to the old parallax hills for that
+frame, so a build without the art still runs.
 
 ## UI
 

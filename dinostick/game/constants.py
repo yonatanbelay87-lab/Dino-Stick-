@@ -569,6 +569,122 @@ PARALLAX_LAYERS: Final[tuple[tuple[float, float, tuple], ...]] = (
 PARALLAX_HILL_SPACING: Final[float] = 470.0  # distance between hill centres
 PARALLAX_HILL_WIDTH: Final[float] = 400.0  # width of one dome
 
+# ---------------------------------------------------------------------------
+# Season backdrop
+# ---------------------------------------------------------------------------
+#
+# The hills above are the fallback. The real background is a strip of painted
+# season art scrolling right to left behind the runway, and it is driven by
+# DISTANCE rather than by elapsed time or an accumulator, so every mode --
+# local, host and client -- shows the same season at the same metre mark
+# without any of it ever going on the wire. See game/backdrop.py.
+
+BG_DIR_NAME: Final[str] = "Dino-Stick BG pics"
+
+# The cycle, in order: (file, is this a transition?). Seasons hold for
+# BG_SEASON_METRES and repeat; a transition is laid down exactly once, so it
+# sweeps past a single time on its way to the next season. After the last one
+# (8T1) the cycle wraps back to season 1.
+BG_SEQUENCE: Final[tuple[tuple[str, bool], ...]] = (
+    ("1-Start-Season.png", False),
+    ("1T2.png", True),
+    ("2-Rainy-Season.png", False),
+    ("2T3.png", True),
+    ("3-Snowy-Season.png", False),
+    ("3T4.png", True),
+    ("4-Mid-Season.png", False),
+    ("4T5.png", True),
+    ("5-Desert-Season.png", False),
+    ("5T6.png", True),
+    ("6-Astroid-Season.png", False),
+    ("6T7.png", True),
+    ("7-Ashy-Season.png", False),
+    ("7T8.png", True),
+    ("8-Grassland-Season.png", False),
+    ("8T1.png", True),
+)
+
+BG_SEASON_METRES: Final[float] = 500.0
+# How much ground the team covers while one transition image makes its single
+# pass. Fixed in METRES rather than derived from the image width so the whole
+# cycle is a pure function of distance: two players on differently shaped
+# screens are in the same season at the same metre mark.
+BG_TRANSITION_METRES: Final[float] = 100.0
+
+# Fraction of world speed the backdrop scrolls at. Below 1.0 because it is
+# scenery on the horizon: matching the runway exactly makes distant mountains
+# read as a wall sliding past a foot from your face. Approximate -- each
+# season nudges it so a whole number of copies lands in exactly 500 m, which
+# is what keeps the tiling seamless right up to the transition.
+BG_PARALLAX: Final[float] = 0.45
+
+# Where each image's own painted ground line sits, as a fraction of its height
+# measured up from the bottom. Every image is dropped so that line lands on
+# GROUND_Y -- the line the dinos actually run along -- which is what stops the
+# team floating above the painted ground or sinking into it, and what keeps
+# the ground continuous across a seam between two different images.
+#
+# Measured off the art, not guessed: it is the strongest horizontal edge in
+# the bottom third of each image, which is exactly where the surface meets the
+# dirt/rock band. They are not all the same -- the rainy and desert scenes put
+# their waterline and sand noticeably lower than the jungle puts its grass --
+# and a single shared value left a visible step in the ground at every
+# transition.
+BG_GROUND_FRACTIONS: Final[dict[str, float]] = {
+    "1-Start-Season.png": 0.121,
+    "1T2.png": 0.103,
+    "2-Rainy-Season.png": 0.081,
+    "2T3.png": 0.088,
+    "3-Snowy-Season.png": 0.133,
+    "3T4.png": 0.111,
+    "4-Mid-Season.png": 0.121,
+    "4T5.png": 0.118,
+    "5-Desert-Season.png": 0.091,
+    "5T6.png": 0.122,
+    "6-Astroid-Season.png": 0.127,
+    "6T7.png": 0.111,
+    "7-Ashy-Season.png": 0.111,
+    "7T8.png": 0.111,
+    "8-Grassland-Season.png": 0.115,
+    "8T1.png": 0.108,
+}
+# Only the OFFSET is per image; the height is shared, or the world would zoom
+# in and out by a third from one season to the next. This is the fraction the
+# shared height is sized against: an image whose own fraction is smaller would
+# not reach the bottom edge of the screen, so it gets nudged down instead of
+# leaving a strip of bare background under it (see Backdrop.tiles). Lowering
+# this cures those nudges at the cost of magnifying every season.
+BG_GROUND_FRACTION: Final[float] = 0.10
+BG_GROUND_FRACTION_MAX: Final[float] = 0.14  # tallest sky above a ground line
+
+# Used for layout in the frame or two before an image has finished decoding,
+# so the strip does not jolt sideways when the real aspect ratio arrives.
+BG_FALLBACK_ASPECT: Final[float] = 3.0
+# Anything squarer than this is not one of our backgrounds -- it is Kivy's
+# "loading" or "error" placeholder, which must never be drawn as scenery.
+BG_MIN_ASPECT: Final[float] = 1.5
+
+# Textures held at once. Three segments can be on screen together, and one
+# more is kept warm ahead of the player; the rest are dropped so a long run
+# does not end up holding all sixteen in video memory.
+BG_CACHE: Final[int] = 6
+# How far ahead the next image starts decoding. Loading is asynchronous, so
+# this only has to beat the decode, not the whole segment.
+BG_PREFETCH_METRES: Final[float] = 80.0
+
+# Nearest-neighbour magnification: the art is pixel art, and it is drawn
+# roughly 2x, where smoothing turns crisp pixels into mush.
+BG_PIXEL_ART: Final[bool] = True
+
+# The renderer scrolls the backdrop with its own smoothed metre count, because
+# a client's distance arrives in ~20 Hz steps and stepping the scenery at
+# snapshot rate is visible as a stutter. It advances locally at the world
+# speed and eases toward the authoritative figure at this rate (per second)...
+BG_CORRECT_RATE: Final[float] = 2.0
+# ...but a gap this large is not lag, it is a different run (or a client that
+# just joined one in progress), so the scenery jumps straight there.
+BG_RESYNC_METRES: Final[float] = 15.0
+
 NAMEPLATE_OFFSET: Final[float] = 16.0  # px above a dino's head
 
 SOUND_VOLUME: Final[float] = 0.4
