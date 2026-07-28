@@ -5,7 +5,14 @@ package.name = dinostick
 package.domain = org.dinostick
 
 source.dir = .
-source.include_exts = py,png,jpg,kv,atlas,wav,ogg,ttf
+# ttf is what ships the UI fonts (assets/fonts/), and the assets/*/* pattern is
+# what reaches into that subfolder -- assets/* alone would only take the files
+# sitting directly in assets/. See assets/fonts/README.md.
+#
+# The fonts are optional: ui/fonts.py falls back to the Roboto inside Kivy and
+# logs a warning if a file is absent, so a build with an empty assets/fonts/
+# still produces a working APK.
+source.include_exts = py,png,jpg,kv,atlas,wav,ogg,ttf,md
 source.include_patterns = assets/*,assets/*/*
 
 version = 0.1.0

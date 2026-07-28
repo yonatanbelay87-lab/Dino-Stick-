@@ -8,6 +8,7 @@ co-op shows a fixed two-player list.
 from __future__ import annotations
 
 from kivy.app import App
+from kivy.clock import Clock
 from kivy.metrics import dp
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
@@ -18,7 +19,9 @@ from kivy.utils import platform
 from game import constants as C
 from net import protocol
 from ui import settings, theme
-from ui.widgets import (Badge, Caption, Card, Dot, MenuButton, Panel, Title)
+from ui.widgets import (Badge, Caption, Card, DashedCard, DinoAvatar,
+                        DinoPicker, IconButton, LiveDot, MenuButton, Panel,
+                        Title)
 
 from . import GAME, MENU
 
@@ -28,53 +31,85 @@ class LobbyScreen(Screen):
         super().__init__(**kw)
         self._ready = False
 
-        root = Panel()
-        root.add_widget(Title("Lobby", theme.FONT_HEADING))
+        # Top-aligned, not centred. The two halves hold very different amounts
+        # -- four roster rows on the left against three controls on the right
+        # -- and centring each one independently started them at two unrelated
+        # heights, which is what made the screen read as two screens.
+        root = Panel(columns=2, align="top")
 
-        self.subtitle = Caption("", theme.FONT_SMALL)
-        root.add_widget(self.subtitle)
+        # -- left: who is here ----------------------------------------------
+        #
+        # Title and subtitle are ONE group with a hairline gap, then a normal
+        # gap to the content below. Spaced evenly they read as three unrelated
+        # lines; grouped, the eye takes the heading and its explanation in one
+        # go and moves on.
+        heading = BoxLayout(orientation="vertical", size_hint_y=None,
+                            spacing=theme.SPACE_1)
+        header = BoxLayout(orientation="horizontal", size_hint_y=None,
+                           height=theme.FONT_HEADING * 1.5,
+                           spacing=theme.SPACE_2)
+        self.live_dot = LiveDot(pos_hint={"center_y": 0.5})
+        header.add_widget(self.live_dot)
+        header.add_widget(Title("LOBBY", theme.FONT_HEADING, halign="left"))
+        heading.add_widget(header)
+
+        self.subtitle = Caption("", theme.FONT_SMALL, halign="left")
+        heading.add_widget(self.subtitle)
+        heading.bind(minimum_height=heading.setter("height"))
+        root.col_left.add_widget(heading)
 
         # The host's address, big enough to read out loud across a room. It is
         # the one thing a host has to tell everybody, and it used to be buried
-        # mid-sentence in the subtitle.
-        self.address_card = Card(fill=theme.SURFACE_ALT, outline=(0, 0, 0, 0),
+        # mid-sentence in the subtitle. Mono so 1/l and 0/O cannot be confused
+        # by whoever is typing it in at the other end.
+        self.address_card = Card(fill=theme.SURFACE_ALT, outline=theme.BORDER,
                                  auto_height=False, size_hint_y=None, height=0,
-                                 opacity=0.0)
+                                 opacity=0.0, orientation="horizontal")
+        address_text = BoxLayout(orientation="vertical", spacing=0)
         self.address_caption = Caption("OTHERS JOIN AT", theme.FONT_CAPTION,
-                                       color=theme.FAINT)
-        self.address_value = Caption("", theme.FONT_HEADING, color=theme.FG)
-        self.address_card.add_widget(self.address_caption)
-        self.address_card.add_widget(self.address_value)
-        root.add_widget(self.address_card)
+                                       color=theme.FAINT, halign="left")
+        self.address_value = Caption("", theme.FONT_HEADING, color=theme.FG,
+                                     mono=True, halign="left")
+        address_text.add_widget(self.address_caption)
+        address_text.add_widget(self.address_value)
+        self.address_card.add_widget(address_text)
+        self.copy_button = IconButton("copy", self._copy_address,
+                                      variant="quiet",
+                                      pos_hint={"center_y": 0.5})
+        self.address_card.add_widget(self.copy_button)
+        root.col_left.add_widget(self.address_card)
 
-        # Scrollable: four players plus buttons do not fit the short axis of a
-        # phone held in landscape.
-        # Fixed height: the panel's column is content-sized, so a size_hint of
-        # 1 here would collapse the list to nothing.
         # Grows with the roster but never past four rows, after which it
         # scrolls. A fixed height would leave a dead gap with two players.
         self.player_scroll = ScrollView(bar_width=dp(4), size_hint_y=None,
                                         height=theme.ROW_HEIGHT,
                                         do_scroll_x=False)
-        self.player_list = BoxLayout(orientation="vertical", spacing=theme.GAP_SM,
+        # 8dp between rows, not 4. At 4 the outlines of adjacent cards nearly
+        # touched and the list read as one striped block; 8 lets each player be
+        # their own card without the stack turning busy.
+        self.player_list = BoxLayout(orientation="vertical",
+                                     spacing=theme.SPACE_2,
                                      size_hint_y=None)
         self.player_list.bind(minimum_height=self._sync_list_height)
         self.player_scroll.add_widget(self.player_list)
-        root.add_widget(self.player_scroll)
+        root.col_left.add_widget(self.player_scroll)
 
-        self.skin_button = MenuButton("Dino: Rex", self._cycle_skin,
-                                      variant="secondary",
-                                      subtitle="tap to change")
-        root.add_widget(self.skin_button)
+        # -- right: your dino, and the way in -------------------------------
+        self.dino_picker = DinoPicker(self._set_skin)
+        root.col_right.add_widget(self.dino_picker)
 
-        self.ready_button = MenuButton("I'm Ready", self._toggle_ready)
-        root.add_widget(self.ready_button)
+        self.ready_button = MenuButton("I'M READY", self._toggle_ready)
+        root.col_right.add_widget(self.ready_button)
 
-        self.start_button = MenuButton("Start Game", self._start)
-        root.add_widget(self.start_button)
+        self.start_button = MenuButton("START GAME", self._start)
+        root.col_right.add_widget(self.start_button)
 
-        root.add_widget(MenuButton("Leave", self._back, variant="quiet",
-                                   height=theme.BUTTON_HEIGHT_SMALL))
+        root.col_right.add_widget(MenuButton("Leave", self._back, variant="quiet",
+                                         height=theme.BUTTON_HEIGHT_SMALL))
+
+        # Kept as an alias: refresh() retitles it, and the old name is part of
+        # the screen's surface. The picker owns the label now.
+        self.skin_button = self.dino_picker
         self.add_widget(root)
 
     # -- lifecycle ----------------------------------------------------------
@@ -99,14 +134,18 @@ class LobbyScreen(Screen):
 
     def _show_address(self, visible: bool) -> None:
         self.address_card.opacity = 1.0 if visible else 0.0
-        self.address_card.height = (
+        self.address_card.disabled = not visible
+        # Tall enough for the copy button as well as the two lines of text,
+        # since the card is a row now rather than a stack.
+        self.address_card.height = max(
             self.address_caption.height + self.address_value.height
-            + 2 * theme.CARD_PAD + theme.GAP_SM) if visible else 0
+            + 2 * theme.CARD_PAD,
+            self.copy_button.height + 2 * theme.SPACE_2) if visible else 0
 
     def _sync_list_height(self, _widget, minimum_height: float) -> None:
         self.player_list.height = minimum_height
-        self.player_scroll.height = min(minimum_height,
-                                        (theme.ROW_HEIGHT + theme.GAP_SM) * 4.2)
+        self.player_scroll.height = min(
+            minimum_height, (theme.ROW_HEIGHT + theme.SPACE_2) * 4.2)
 
     @staticmethod
     def _set_visible(widget, visible: bool, height: float) -> None:
@@ -128,19 +167,24 @@ class LobbyScreen(Screen):
             return
 
         self.player_list.clear_widgets()
-        for entry in self._entries(app):
+        entries = self._entries(app)
+        for entry in entries:
             self.player_list.add_widget(self._row(entry, app))
 
-        skin_name = C.SKIN_NAMES[app.skin % len(C.SKIN_NAMES)]
-        self.skin_button.text = self.skin_button.compose(
-            f"Dino: {skin_name}", "tap to change")
+        # A dashed placeholder for the seat nobody is in yet. Hosting alone
+        # with a bare list looks like the lobby failed to load; a slot that
+        # says it is waiting looks like a lobby.
+        if app.mode == "host" and len(entries) < C.MAX_PLAYERS:
+            self.player_list.add_widget(self._open_slot(len(entries) + 1))
+
+        self.dino_picker.set_skin(app.skin)
 
         is_host = app.mode == "host"
         is_client = app.mode == "client"
 
         self._set_visible(self.ready_button, is_client, theme.BUTTON_HEIGHT)
-        self.ready_button.text = ("Ready - tap to cancel" if self._ready
-                                  else "I'm Ready")
+        self.ready_button.text = ("READY - tap to cancel" if self._ready
+                                  else "I'M READY")
 
         self._set_visible(self.start_button, not is_client,
                           theme.BUTTON_HEIGHT)
@@ -149,7 +193,7 @@ class LobbyScreen(Screen):
             count = app.host.player_count() if app.host else 1
             self.start_button.disabled = not everyone
             if everyone:
-                self.start_button.text = (f"Start Game ({count} player"
+                self.start_button.text = (f"START GAME ({count} player"
                                           f"{'' if count == 1 else 's'})")
             else:
                 waiting = max(0, count - 1)
@@ -181,18 +225,28 @@ class LobbyScreen(Screen):
         only part anybody is actually scanning for -- was last.
         """
         skin_index = int(entry.get("skin", 0))
-        color = C.SKIN_COLORS[skin_index % len(C.SKIN_COLORS)]
         ready = bool(entry.get("ready"))
 
+        # No outline. Four outlined cards in a stack put four hairlines within
+        # 8dp of each other and the whole list buzzed; the fill alone separates
+        # a row from the sky perfectly well, and dropping the stroke is most of
+        # what makes the column feel calm.
         row = Card(orientation="horizontal", auto_height=False,
                    size_hint_y=None, height=theme.ROW_HEIGHT,
-                   padding=(theme.PAD, 0), spacing=theme.GAP,
-                   fill=theme.SURFACE, outline=theme.BORDER)
+                   padding=(theme.SPACE_2, theme.SPACE_1),
+                   spacing=theme.SPACE_2,
+                   fill=theme.SURFACE, outline=(0, 0, 0, 0))
 
-        row.add_widget(Dot(color=color, pos_hint={"center_y": 0.5}))
+        # The player's actual dino, not a coloured dot. Same data the renderer
+        # uses, so the avatar and the character you run as cannot disagree.
+        row.add_widget(DinoAvatar(
+            skin_index,
+            size=(theme.ROW_HEIGHT * 0.7, theme.ROW_HEIGHT * 0.7),
+            pos_hint={"center_y": 0.5}))
 
         name = Label(text=str(entry.get("name", "Player")),
-                     font_size=theme.FONT_SMALL, color=theme.FG,
+                     font_size=theme.FONT_SMALL,
+                     font_name=theme.FONT_BODY_NAME, color=theme.FG,
                      halign="left", valign="middle", shorten=True,
                      shorten_from="right")
         name.bind(size=lambda w, *_: setattr(w, "text_size",
@@ -203,10 +257,25 @@ class LobbyScreen(Screen):
             row.add_widget(Badge(text, color=theme.GROUND,
                                  pos_hint={"center_y": 0.5}))
 
-        row.add_widget(Badge("READY" if ready else "NOT READY",
+        row.add_widget(Badge("READY" if ready else "WAITING",
                              color=theme.ACCENT if ready else theme.FAINT,
                              filled=ready, pos_hint={"center_y": 0.5}))
         return row
+
+    @staticmethod
+    def _open_slot(number: int) -> DashedCard:
+        """The seat nobody is in yet."""
+        slot = DashedCard(size_hint_y=None, height=theme.ROW_HEIGHT,
+                          padding=(theme.SPACE_3, theme.SPACE_1),
+                          orientation="horizontal")
+        label = Label(text=f"Open slot  -  waiting for player {number}...",
+                      font_size=theme.FONT_SMALL,
+                      font_name=theme.FONT_BODY_NAME, color=theme.FAINT,
+                      halign="left", valign="middle")
+        label.bind(size=lambda w, *_: setattr(w, "text_size",
+                                              (w.width, w.height)))
+        slot.add_widget(label)
+        return slot
 
     @staticmethod
     def _tags(entry: dict, app) -> list[str]:
@@ -222,9 +291,33 @@ class LobbyScreen(Screen):
 
     # -- actions ------------------------------------------------------------
 
-    def _cycle_skin(self) -> None:
+    def _copy_address(self) -> None:
+        """Put the host address on the clipboard.
+
+        Kivy's Clipboard is a local system call, not a network one -- it is the
+        same API the OS uses for any copy/paste. The label doubles as the
+        confirmation so there is no toast to time out.
+        """
+        text = self.address_value.text
+        if not text:
+            return
+        try:
+            from kivy.core.clipboard import Clipboard  # noqa: PLC0415
+
+            Clipboard.copy(text)
+        except Exception:
+            # No clipboard provider (a bare-bones Linux box, mostly). The
+            # address is still on screen to read out, so say nothing.
+            return
+        self.address_caption.text = "COPIED!"
+        Clock.schedule_once(
+            lambda _dt: setattr(self.address_caption, "text",
+                                "OTHERS JOIN AT"), 1.6)
+
+    def _set_skin(self, index: int) -> None:
+        """Pick a specific dino. The arrow picker calls this."""
         app = App.get_running_app()
-        app.skin = (app.skin + 1) % len(C.SKIN_NAMES)
+        app.skin = index % len(C.SKIN_NAMES)
         settings.set_value("skin", app.skin)
         if app.mode == "client" and app.client is not None:
             app.client.send(protocol.skin(app.skin))
@@ -232,6 +325,11 @@ class LobbyScreen(Screen):
             app.host.host_skin = app.skin
             app.host.push_lobby()
         self.refresh()
+
+    def _cycle_skin(self) -> None:
+        """Step to the next dino. Kept: it is part of this screen's surface."""
+        app = App.get_running_app()
+        self._set_skin(app.skin + 1)
 
     def _toggle_ready(self) -> None:
         app = App.get_running_app()

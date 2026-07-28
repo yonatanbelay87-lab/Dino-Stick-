@@ -117,13 +117,15 @@ class GameScreen(Screen):
         # clipped off the bottom of a card that could not grow.
         self.score_card = Card(
             size_hint=(None, None),
-            fill=(1.0, 1.0, 1.0, 0.88), outline=(0, 0, 0, 0.08),
+            fill=theme.HUD_SURFACE, outline=theme.HUD_OUTLINE,
             auto_height=True, padding=(theme.SPACE_3, theme.SPACE_2),
             spacing=0)
-        self.score_stat = Stat("Score", "0", value_size=theme.FONT_HEADING)
+        self.score_stat = Stat("Score", "0", value_size=theme.FONT_HEADING,
+                              value_color=theme.HUD_TEXT,
+                              caption_color=theme.HUD_FAINT)
         self.score_card.add_widget(self.score_stat)
         self.progress_label = Label(
-            text="", font_size=theme.FONT_SMALL, color=theme.GROUND,
+            text="", font_size=theme.FONT_SMALL, color=theme.HUD_MUTED,
             size_hint_y=None, height=theme.FONT_SMALL * 1.6)
         self.score_card.add_widget(self.progress_label)
         root.add_widget(self.score_card)
@@ -132,7 +134,7 @@ class GameScreen(Screen):
         # top, clear of both thumbs in landscape. The bar changes colour with
         # the value, so it is readable without looking straight at it.
         self.tension_label = Label(
-            text="ROPE", font_size=theme.FONT_CAPTION, color=theme.FAINT,
+            text="ROPE", font_size=theme.FONT_CAPTION, color=theme.HUD_FAINT,
             size_hint=(None, None),
             size=(dp(80), theme.FONT_CAPTION * 1.6))
         root.add_widget(self.tension_label)
@@ -155,7 +157,7 @@ class GameScreen(Screen):
 
         # Connection quality (client) / role (host).
         self.net_label = Label(
-            text="", font_size=theme.FONT_SMALL, color=theme.GROUND,
+            text="", font_size=theme.FONT_SMALL, color=theme.HUD_MUTED,
             halign="left", valign="middle",
             size_hint=(None, None), size=(dp(240), dp(24)))
         self.net_label.bind(size=lambda w, *_: setattr(
@@ -174,7 +176,7 @@ class GameScreen(Screen):
             root.add_widget(plate)
 
         self.hint_label = Label(
-            text="", font_size=theme.FONT_SMALL, color=theme.FAINT,
+            text="", font_size=theme.FONT_SMALL, color=theme.HUD_FAINT,
             halign="center", valign="middle",
             size_hint=(None, None), size=(dp(620), dp(24)))
         self.hint_label.bind(size=lambda w, *_: setattr(
@@ -189,7 +191,7 @@ class GameScreen(Screen):
                               f"[/size]",
                          markup=True, halign="center", valign="middle",
                          font_size=theme.FONT_TITLE,
-                         color=theme.FAINT, opacity=0.0,
+                         color=theme.HUD_FAINT, opacity=0.0,
                          size_hint=(None, None), size=(dp(240), dp(88)))
             self.zone_hints.append(hint)
             root.add_widget(hint)

@@ -18,14 +18,19 @@ from . import GAME, MENU
 class GameOverScreen(Screen):
     def __init__(self, **kw) -> None:
         super().__init__(**kw)
-        root = Panel()
-        root.add_widget(Title("Run over", theme.FONT_HEADING))
+        root = Panel(columns=2)
 
+        # -- left: what just happened ---------------------------------------
+        #
         # The score is the headline; distance and time are the supporting
         # facts. Reading order was the other way round before, with the score
         # sharing a size with everything else on the screen.
+        self.headline = Title("RUN OVER", theme.FONT_TITLE)
+        root.col_left.add_widget(self.headline)
+
         self.score_card = Card()
-        self.score_stat = Stat("Team score", "0", value_size=theme.FONT_DISPLAY)
+        self.score_stat = Stat("Team score", "0", value_size=theme.FONT_DISPLAY,
+                               value_color=theme.ACCENT)
         self.score_card.add_widget(self.score_stat)
 
         stats_row = BoxLayout(orientation="horizontal", size_hint_y=None,
@@ -37,15 +42,16 @@ class GameOverScreen(Screen):
             stats_row.add_widget(stat)
         stats_row.height = self.distance_stat.height
         self.score_card.add_widget(stats_row)
-        root.add_widget(self.score_card)
+        root.col_left.add_widget(self.score_card)
 
         self.cause_label = Caption("", theme.FONT_SMALL, color=theme.DANGER)
-        root.add_widget(self.cause_label)
+        root.col_left.add_widget(self.cause_label)
 
-        self.rematch_button = MenuButton("Play Again", self._rematch)
-        root.add_widget(self.rematch_button)
-        root.add_widget(MenuButton("Back to Menu", self._menu,
-                                   variant="secondary"))
+        # -- right: what to do next -----------------------------------------
+        self.rematch_button = MenuButton("PLAY AGAIN", self._rematch)
+        root.col_right.add_widget(self.rematch_button)
+        root.col_right.add_widget(MenuButton("Back to Menu", self._menu,
+                                         variant="secondary"))
         self.add_widget(root)
 
     def on_pre_enter(self, *_args) -> None:
@@ -54,7 +60,7 @@ class GameOverScreen(Screen):
         is_client = app is not None and app.mode == "client"
         self.rematch_button.disabled = is_client
         self.rematch_button.text = ("Waiting for the host..." if is_client
-                                    else "Play Again")
+                                    else "PLAY AGAIN")
 
     def show_result(self, score: int, distance: float,
                     cause_player_id: int | None = None,

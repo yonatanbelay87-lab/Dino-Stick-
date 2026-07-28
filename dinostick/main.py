@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kivy.app import App  # noqa: E402
 from kivy.clock import Clock  # noqa: E402
 from kivy.core.window import Window  # noqa: E402
+from kivy.logger import Logger  # noqa: E402
 from kivy.uix.modalview import ModalView  # noqa: E402
 from kivy.uix.screenmanager import NoTransition, ScreenManager  # noqa: E402
 
@@ -40,7 +41,9 @@ from screens.game import GameScreen  # noqa: E402
 from screens.gameover import GameOverScreen  # noqa: E402
 from screens.lobby import LobbyScreen  # noqa: E402
 from screens.menu import MenuScreen  # noqa: E402
+from ui import fonts  # noqa: E402
 from ui import settings  # noqa: E402
+from ui import theme  # noqa: E402
 from ui.insets import insets  # noqa: E402
 
 MODE_LOCAL = "local"
@@ -75,8 +78,16 @@ class DinoStickApp(App):
     title = C.APP_NAME
 
     def build(self) -> ScreenManager:
-        Window.clearcolor = C.COLOR_BG
+        # The sunset scene paints over this; it is only ever seen for the one
+        # frame before the first screen lays out.
+        Window.clearcolor = theme.SKY_MID
         _keep_screen_on()
+
+        # Fonts BEFORE any widget exists, or the first labels are built against
+        # the default font and keep it. Purely local files -- see ui/fonts.py;
+        # a missing .ttf logs a warning and falls back to Kivy's own Roboto.
+        fonts.register()
+        Logger.info(fonts.report())
 
         # Start measuring the notch and the gesture bar before any screen is
         # built, so the first frame is already laid out inside the safe area
