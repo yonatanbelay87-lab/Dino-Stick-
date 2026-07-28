@@ -87,9 +87,10 @@ class GameOverScreen(Screen):
     def _rematch(self) -> None:
         app = App.get_running_app()
         if app is not None and app.mode == "host" and app.host is not None:
-            # Fresh seed, so a rematch is a genuinely new world.
+            # Fresh seed, so a rematch is a genuinely new world -- and a fresh
+            # session on every device, built from it.
             app.host.broadcast(protocol.rematch())
-            app.host.start_game()
+            app.host_start_game()
         self.manager.current = GAME
 
     def _menu(self) -> None:

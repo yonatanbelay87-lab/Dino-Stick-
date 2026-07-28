@@ -3,8 +3,34 @@ name: Android APK
 # Buildozer cannot run on Windows, so the APK is built here instead of on the
 # dev machine. Run it from the Actions tab ("Run workflow"), or let it fire on
 # a push that touches the game.
+#
+# Two build types, and the difference matters on a real phone:
+#
+#   debug    what every push builds. Fast, but signed with Android's PUBLIC
+#            debug key (~/.android/debug.keystore, password "android" -- the
+#            same key on every developer machine on earth) and marked
+#            android:debuggable="true". Play Protect escalates that to "Unsafe
+#            app blocked", and some OEM builds refuse it outright. Fine on your
+#            own device, never something to hand to anyone else.
+#
+#   release  signed with OUR keystore, not debuggable. Requires the four
+#            secrets listed in the signing step below. This is what you send to
+#            other people.
+#
+# Neither one is warning-free when sideloaded: Play Protect scores an app by
+# how many devices have seen this package + signer pair, and a brand new key
+# has no reputation. Release signing removes the *debuggable* escalation and
+# gives you a real identity; only publishing through Play removes the notice.
 on:
   workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Which build to produce'
+        type: choice
+        options:
+          - debug
+          - release
+        default: debug
   push:
     branches: [main]
     paths:
@@ -17,6 +43,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # Anything that is not a manual "release" run is a debug build.
+  BUILD_TYPE: ${{ github.event.inputs.build_type || 'debug' }}
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -25,6 +55,27 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # Fail here rather than 40 minutes later at the signing step, which is
+      # the only place a missing secret would otherwise show up.
+      - name: Check the signing secrets are present
+        if: env.BUILD_TYPE == 'release'
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -eu
+          missing=""
+          [ -n "${KS_B64:-}" ]   || missing="$missing ANDROID_KEYSTORE_BASE64"
+          [ -n "${KS_PASS:-}" ]  || missing="$missing ANDROID_KEYSTORE_PASSWORD"
+          [ -n "${KEY_ALIAS:-}" ] || missing="$missing ANDROID_KEY_ALIAS"
+          if [ -n "$missing" ]; then
+            echo "::error::a release build needs these repository secrets:$missing"
+            echo "::error::see the signing step in this workflow for how to create them"
+            exit 1
+          fi
+          echo "signing secrets present"
 
       # p4a's recipes are still happiest on 3.11: 3.12 removed distutils and
       # several of them have not caught up.
@@ -77,16 +128,148 @@ jobs:
           restore-keys: |
             buildozer-local-${{ runner.os }}-
 
-      - name: Build debug APK
+      - name: Build the APK
         working-directory: dinostick
-        run: buildozer -v android debug
+        run: buildozer -v android "$BUILD_TYPE"
 
-      # Uploaded BEFORE the checks below, so a failed assertion still leaves
-      # you an APK to look at rather than throwing the whole 40 minutes away.
+      # ---------------------------------------------------------------------
+      # Signing
+      # ---------------------------------------------------------------------
+      #
+      # Done here with apksigner rather than by handing p4a the
+      # P4A_RELEASE_KEYSTORE environment variables. Two reasons: p4a silently
+      # changes the output filename depending on whether those are set (
+      # "-release.apk" vs "-release-unsigned.apk"), and doing it ourselves means
+      # the verification below is checking the exact file that gets uploaded.
+      #
+      # ONE-TIME SETUP -- create the keystore on your own machine and never
+      # commit it. From PowerShell in the repo root:
+      #
+      #   keytool -genkeypair -v -keystore dinostick-release.jks `
+      #     -alias dinostick -keyalg RSA -keysize 4096 `
+      #     -validity 10000 -storetype PKCS12
+      #
+      #   [Convert]::ToBase64String(
+      #     [IO.File]::ReadAllBytes("dinostick-release.jks")) |
+      #     Set-Content keystore.b64
+      #
+      # Then in GitHub: Settings -> Secrets and variables -> Actions -> New
+      # repository secret, four times:
+      #
+      #   ANDROID_KEYSTORE_BASE64    the whole contents of keystore.b64
+      #   ANDROID_KEYSTORE_PASSWORD  the password you just chose
+      #   ANDROID_KEY_ALIAS          dinostick
+      #   ANDROID_KEY_PASSWORD       same as the store password (PKCS12 keeps
+      #                              one password for both)
+      #
+      # Then delete keystore.b64 and BACK UP dinostick-release.jks somewhere
+      # safe. Lose it and you can never ship an update that Android accepts as
+      # the same app -- everyone would have to uninstall and reinstall, losing
+      # their settings. There is no recovery for this.
+      - name: Sign the release APK
+        if: env.BUILD_TYPE == 'release'
+        working-directory: dinostick
+        env:
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          # PKCS12 uses one password for store and key; fall back so a
+          # missing ANDROID_KEY_PASSWORD is not an error.
+          KEY_PASS="${KEY_PASS:-$KS_PASS}"
+          # tr strips the newline Set-Content appends and any wrapping the
+          # secret picked up on the way in; base64 -d is fussier than it looks.
+          printf '%s' "$KS_B64" | tr -d '\n\r ' | base64 -d \
+            > "$RUNNER_TEMP/release.jks"
+          test -s "$RUNNER_TEMP/release.jks" || {
+            echo "::error::keystore decoded to nothing -- is"
+            echo "::error::ANDROID_KEYSTORE_BASE64 the base64 text, not the file?"
+            exit 1
+          }
+
+          # buildozer keeps its own SDK under ~/.buildozer; the runner has one
+          # too. Take the newest build-tools from whichever is present.
+          find_tool() {
+            find "$HOME/.buildozer" "${ANDROID_HOME:-/usr/local/lib/android/sdk}" \
+              -name "$1" -type f 2>/dev/null | sort -V | tail -1
+          }
+          APKSIGNER=$(find_tool apksigner)
+          ZIPALIGN=$(find_tool zipalign)
+          test -x "$APKSIGNER" || { echo "::error::apksigner not found"; exit 1; }
+          echo "using $APKSIGNER"
+
+          unsigned=$(ls bin/*-release-unsigned.apk 2>/dev/null | head -1 || true)
+          if [ -z "$unsigned" ]; then
+            unsigned=$(ls bin/*-release.apk 2>/dev/null | head -1 || true)
+          fi
+          test -n "$unsigned" || { echo "::error::no release APK in bin/"; exit 1; }
+          echo "signing $unsigned"
+
+          out="bin/$(basename "${unsigned%-unsigned.apk}" .apk)-signed.apk"
+          # Zipalign BEFORE signing: apksigner refuses to align afterwards, and
+          # an unaligned APK wastes memory on device.
+          "$ZIPALIGN" -p -f 4 "$unsigned" "$RUNNER_TEMP/aligned.apk"
+          "$APKSIGNER" sign \
+            --ks "$RUNNER_TEMP/release.jks" \
+            --ks-pass env:KS_PASS \
+            --ks-key-alias "$KEY_ALIAS" \
+            --key-pass env:KEY_PASS \
+            --out "$out" \
+            "$RUNNER_TEMP/aligned.apk"
+
+          # Drop the unsigned copy so it cannot be picked up by the upload and
+          # handed to somebody by mistake.
+          rm -f "$unsigned"
+          echo "SIGNED_APK=$out" >> "$GITHUB_ENV"
+
+      - name: Confirm the release APK is properly signed
+        if: env.BUILD_TYPE == 'release'
+        working-directory: dinostick
+        run: |
+          set -euo pipefail
+          find_tool() {
+            find "$HOME/.buildozer" "${ANDROID_HOME:-/usr/local/lib/android/sdk}" \
+              -name "$1" -type f 2>/dev/null | sort -V | tail -1
+          }
+          APKSIGNER=$(find_tool apksigner)
+          "$APKSIGNER" verify --verbose --print-certs "$SIGNED_APK"
+
+          # The two things that actually drive the install warning.
+          certs=$("$APKSIGNER" verify --print-certs "$SIGNED_APK")
+          if echo "$certs" | grep -qi "CN=Android Debug"; then
+            echo "::error::still signed with the public Android debug key"
+            exit 1
+          fi
+
+          AAPT=$(find_tool aapt)
+          if [ -n "$AAPT" ] && [ -x "$AAPT" ]; then
+            if "$AAPT" dump badging "$SIGNED_APK" \
+                 | grep -q "application-debuggable"; then
+              echo "::error::APK is still marked debuggable"
+              exit 1
+            fi
+            echo "not debuggable"
+          else
+            # Newer build-tools may ship only aapt2. Not worth failing the build
+            # over -- the release build type does not set debuggable anyway.
+            echo "::warning::aapt not found, skipped the debuggable check"
+          fi
+          echo "signed with a private key"
+
+      # Always, so a failed signing or verification does not leave the keystore
+      # sitting in the runner's temp directory for the rest of the job.
+      - name: Shred the keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.jks" "$RUNNER_TEMP/aligned.apk"
+
+      # Uploaded BEFORE the asset checks below, so a failed assertion still
+      # leaves you an APK to look at rather than throwing the build away.
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: dinostick-debug-apk
+          name: dinostick-${{ env.BUILD_TYPE }}-apk
           path: dinostick/bin/*.apk
           if-no-files-found: error
           retention-days: 30

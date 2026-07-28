@@ -60,6 +60,18 @@ fullscreen = 1
 #                                discovery finds nothing.
 android.permissions = INTERNET, ACCESS_NETWORK_STATE, ACCESS_WIFI_STATE, CHANGE_WIFI_MULTICAST_STATE
 
+# buildozer 1.6 changed the default release artifact to an AAB, and Android
+# cannot install a .aab -- it is a Play upload format, not a package. Without
+# this line `buildozer android release` produces something you cannot put on a
+# phone at all. Switch it to "aab" only when you are uploading to Play Console.
+android.release_artifact = apk
+android.debug_artifact = apk
+
+# Play requires this to increase with every upload. Irrelevant for sideloading,
+# so it is left to be derived from `version` above; set it explicitly (and bump
+# it) the day you first upload to Play Console.
+#android.numeric_version = 1
+
 android.api = 34
 android.minapi = 24
 # arm64 only. Every Android phone shipped since about 2016 is arm64, and each

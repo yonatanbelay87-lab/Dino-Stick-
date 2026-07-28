@@ -86,6 +86,11 @@ PLAYER_SPACING_X: Final[float] = 110.0
 MIN_PLAYERS: Final[int] = 1
 MAX_PLAYERS: Final[int] = 4
 
+# The player whose device is hosting is always id 0. Lives here rather than in
+# net/host.py because the simulation side needs it too -- the joiner steers its
+# world clock by the host's tick, and it has to know whose tick that is.
+HOST_PLAYER_ID: Final[int] = 0
+
 # ---------------------------------------------------------------------------
 # Elastic rope  (Phase 2 -- tuned there for feel)
 # ---------------------------------------------------------------------------
@@ -437,32 +442,16 @@ DISCOVERY_TIMEOUT: Final[float] = 4.0  # s before a seen host is forgotten
 # both are kept working.
 USE_UDP_GAMEPLAY: Final[bool] = True
 
-# Snapshot rate. 60, not 40, on measured evidence rather than taste: raising
-# the rate turns out to buy far more than raising the interpolation delay.
-# A dropped packet leaves a gap one interval wide, and the delay has to cover
-# the worst gap -- so a faster stream needs a *shorter* delay to ride out the
-# same loss. Swept over 20s runs against three synthetic networks:
-#
-#   bad Wi-Fi (1.2x jitter, 10% loss)   stalls   mean lag
-#     40 Hz / 100 ms delay               0.17%     122 ms
-#     60 Hz /  66 ms delay               0.17%      81 ms   <- same smoothness,
-#                                                              41 ms less lag
-#
-# The cost is bandwidth, and there is not much: a worst-case 936-byte snapshot
-# to three clients is ~165 KB/s up. Serialisation happens once per snapshot,
-# not once per client.
-SNAPSHOT_HZ: Final[int] = 60  # host -> clients, state snapshot rate
-INPUT_HZ: Final[int] = 60  # client -> host, input packet rate
+# The gameplay stream's rate, format and interpolation constants all live in
+# net/statepacket.py, next to the code that packs the packets -- NET_TICK_HZ,
+# INTERP_DELAY, EXTRAP_MAX, PEER_BUFFER, POS_SCALE. They are tunables for one
+# module rather than facts about the game, and splitting them across two files
+# is how a quantisation scale ends up disagreeing with the struct that uses it.
 
-# Inputs are RESENT at INPUT_HZ rather than sent on change, which is what the
-# TCP path did. Over UDP a dropped packet is gone for good, and "the jump you
-# pressed" is not something to lose. Resending is safe because the host tracks
-# a rising edge per tick: a repeated jump:true never produces a second hop.
-#
 # Datagrams carry no length prefix -- UDP preserves message boundaries -- but
 # an oversized one fragments at the IP layer, where losing any fragment loses
-# the whole packet. Measured worst case (4 players, 4 obstacles, 3 power-ups,
-# every effect active) is 936 bytes, so this ceiling is a guard, not a limit.
+# the whole packet. A STATE packet is 15 bytes, so this ceiling now only ever
+# guards a hand-rolled JSON datagram (discovery announcements).
 MAX_DATAGRAM_BYTES: Final[int] = 1200
 
 # How often a client re-announces its UDP endpoint until snapshots start
@@ -470,14 +459,21 @@ MAX_DATAGRAM_BYTES: Final[int] = 1200
 # retry, one unlucky packet leaves that player watching a frozen world.
 UDP_REGISTER_INTERVAL: Final[float] = 0.25
 
-# Fraction of inbound gameplay datagrams to throw away on purpose, for
-# testing. A LAN loses almost nothing, so the only way to find out whether the
-# game degrades gracefully or falls over is to break it deliberately.
+# Deliberate network abuse, for testing. A LAN loses almost nothing, so the
+# only way to find out whether the game degrades gracefully or falls over is to
+# break it on purpose. These wrap the OUTBOUND state stream (net/peers.py,
+# LossyLink), which is the honest place for it: an inbound-only drop cannot
+# reproduce jitter or reordering, and reordering is what exercises the seq
+# filter.
 #
-# Ships at 0.0 and costs one float comparison per packet. Set to 0.10 and the
-# game should stay perfectly smooth: every dropped snapshot is simply replaced
-# by the next one 16ms later, which is the entire reason gameplay left TCP.
-SIMULATED_PACKET_LOSS: Final[float] = 0.0
+# All ship at 0.0 and cost one comparison per packet when off. Set NET_SIM_DROP
+# to 0.15 and NET_SIM_JITTER to 0.08 and the partner should stay smooth (brief
+# extrapolation, no teleporting) while your own dino is completely unaffected --
+# it never touches the network. See NETCODE.md.
+NET_SIM_DROP: Final[float] = 0.0  # fraction of state packets thrown away
+NET_SIM_LATENCY: Final[float] = 0.0  # s of added one-way delay
+NET_SIM_JITTER: Final[float] = 0.0  # s of +- randomness on that delay
+
 SOCKET_TIMEOUT: Final[float] = 5.0
 LENGTH_PREFIX_BYTES: Final[int] = 4  # big-endian uint32 frame header
 MAX_FRAME_BYTES: Final[int] = 1 << 20  # reject absurd frames
@@ -494,73 +490,77 @@ PING_INTERVAL: Final[float] = 1.0
 CONNECTION_TIMEOUT: Final[float] = 6.0
 
 # ---------------------------------------------------------------------------
-# Entity interpolation
+# Peer-authoritative co-op
 # ---------------------------------------------------------------------------
 #
-# Clients deliberately render the world slightly in the PAST. Snapshots arrive
-# 40 times a second at best and unevenly at worst, while the screen redraws 60
-# times a second: rendering the newest snapshot the instant it lands means the
-# world lurches forward on arrival and freezes in between.
+# Every device simulates its OWN dino and nothing else's. Input moves your dino
+# on the frame you pressed it -- there is no round trip in the loop and no
+# correction afterwards, because there is no other authority to be corrected
+# by. Partners arrive as a stream of snapshots and are drawn INTERP_DELAY in
+# the past (net/statepacket.py, net/peers.py).
 #
-# Holding a delay means there is almost always a snapshot on each side of the
-# moment being drawn, so positions can be interpolated between the two and
-# motion comes out continuous no matter how lumpy the arrivals were.
+# That works because this is co-op. Nobody gains by lying about where their own
+# dino is: the only thing you could cheat yourself into is dying. A competitive
+# game would need the host to re-simulate and overrule, and would pay input lag
+# for it.
 #
-# The delay is the whole trade-off: too low and a late packet leaves nothing
-# to interpolate toward (the view stalls); too high and everyone else is
-# visibly behind where they really are.
-#
-# 66 ms is the knee, measured over 20-second runs at 60 fps. It covers four
-# consecutive dropped snapshots at SNAPSHOT_HZ, and on a deliberately awful
-# link (1.2x jitter, 10% loss) it stalls on 0.17% of frames -- the same as a
-# 100 ms delay, while rendering 41 ms closer to the truth. Dropping to 50 ms
-# is where it starts to break down (0.59% stalls).
-INTERP_DELAY_MS: Final[float] = 66.0
-INTERP_DELAY: Final[float] = INTERP_DELAY_MS / 1000.0  # seconds, as used
+# The world is the other half. Obstacles are a pure function of (seed, tick) --
+# see game/world.py -- so both devices spawn the same cactus in the same place
+# from the seed alone, and not one byte of obstacle data is ever sent.
 
-# Snapshots retained for interpolation. Must comfortably exceed the delay:
-# 12 at SNAPSHOT_HZ is 200 ms of history against a 66 ms delay, so the
-# bracketing pair is always still in the buffer even after a run of drops.
-SNAPSHOT_BUFFER: Final[int] = 12
+# How far ahead of the current tick a shared world event is scheduled to take
+# effect. Power-ups change how fast the world scrolls, which changes where the
+# next obstacle spawns, so both devices have to apply one on the SAME tick or
+# their worlds quietly drift apart. Applying it "now" cannot do that -- "now"
+# is a different tick on each device. So the host names a tick far enough ahead
+# that the message beats it there.
+#
+# 12 ticks is 200 ms, which covers a LAN round trip several times over. A
+# device that still receives it late fast-forwards (CoopSession._apply_effect),
+# so the lead is a smoothness margin, not a correctness requirement.
+WORLD_EVENT_LEAD: Final[int] = 12
 
-# ---------------------------------------------------------------------------
-# Client-side prediction
-# ---------------------------------------------------------------------------
+# Seconds between the host sending START and world tick 0 on both devices. It
+# buys the message time to cross the network, so the run begins together rather
+# than half a round trip apart -- in a world where the tick number *is* the
+# obstacle layout, starting late means being permanently offset.
 #
-# Interpolation deliberately renders the past, which is fine for everyone
-# except you: pressing jump and watching your own dino leave the ground one
-# round trip later is the single most noticeable thing in a networked game.
-# So the local dino is simulated immediately, on the client, and corrected
-# afterwards.
-#
-# What is predicted is ONLY your own gravity and jump impulse. The rope is
-# deliberately left out: it couples you to your neighbours, and their inputs
-# are not knowable here -- guessing them would produce confident, wrong motion
-# that then has to be yanked back. The host stays the only authority on the
-# rope, so every rope effect arrives as a correction.
-#
-# Corrections are eased in rather than applied outright. Snapping to the
-# authoritative value every time a packet lands is what makes a character
-# visibly stutter.
-#
-# 0.2 is the knee, measured against a 77 px rope yank (a partner ripping you a
-# solo jump's height off the floor) at 60 fps:
-#
-#   lerp   worst single-frame move   settles in
-#   0.10          7.7 px               417 ms   too long drawn in the wrong place
-#   0.20         15.4 px               200 ms   <- chosen
-#   0.30         23.1 px               117 ms   over a third of a dino in one frame
-#
-# A dino is 60 px tall, so 15 px is a quarter of a body -- perceptible if you
-# stare, invisible during the shake and particles a real yank comes with.
-RECONCILE_LERP: Final[float] = 0.2
+# Short enough to read as the game starting, long enough to cover a LAN trip
+# many times over. The joiner subtracts its own measured latency from it.
+START_COUNTDOWN: Final[float] = 0.4
 
-# Past this much error, easing is the wrong answer: something happened that
-# prediction could not have known about (a rope yank ripping you off the
-# floor, a shield hit, a resync after a stall) and the honest thing is to jump
-# straight to the truth. 120 px is over half a jump's peak height, so ordinary
-# mispredictions never reach it.
-RECONCILE_SNAP: Final[float] = 120.0
+# The joiner eases its world clock toward the host's rather than free-running.
+# Two devices stepping 60 Hz off their own wall clocks drift a tick every few
+# seconds, and a tick of drift is ~10 px of obstacle offset between the two
+# screens. Nobody dies of it (each device rules on its own collisions) but it
+# is visible if a partner appears to clear a cactus by a hair on your screen.
+#
+# Corrections are one tick per frame, so at 60 fps a 20-tick gap closes in a
+# third of a second and no single frame ever jumps. The deadband stops it
+# hunting either side of the truth on ordinary jitter.
+WORLD_SYNC_DEADBAND: Final[int] = 2  # ticks of disagreement to ignore
+WORLD_SYNC_SNAP: Final[int] = 45  # beyond this, jump rather than ease
+
+# How often the host restates the shared score, reliably. Score is derived from
+# distance and distance is derived from the tick, so both devices compute it
+# independently and agree -- this is a cheap belt-and-braces resync that also
+# corrects any drift the tick sync left behind.
+SCORE_SYNC_INTERVAL: Final[float] = 1.0
+# Distance disagreement worth correcting, in px. Below this it is a rounding
+# artefact; above it the difficulty curves are meaningfully out of step.
+SCORE_SYNC_TOLERANCE: Final[float] = 24.0
+
+# Silence from a peer's state stream past this and the rope goes slack for
+# them. It is much shorter than CONNECTION_TIMEOUT because the two answer
+# different questions: this one is "should a frozen dino still be able to drag
+# me into a cactus?" (no, almost immediately), while CONNECTION_TIMEOUT is
+# "has this player left?" (a much bigger claim, made much more slowly).
+PEER_ROPE_TIMEOUT: Final[float] = 1.0
+
+# How far a dino is dimmed once its owner has gone quiet. Dark enough to read
+# as "something is wrong with them", not so dark it looks like a rendering bug
+# or hides a dino you still have to avoid landing on.
+DISCONNECTED_FADE: Final[float] = 0.45
 
 DEFAULT_HOST_NAME: Final[str] = "Dino Stick game"
 

@@ -1,12 +1,29 @@
 """Game screen: fixed-timestep loop, renderer, HUD, input wiring.
 
-Three modes share this screen:
+Two loops share this screen, at deliberately different rates.
 
-  local   -- two dinos on one keyboard, simulated here (Phase 2 behaviour)
-  host    -- the authoritative sim runs here, driven by our Clock, and is
-             broadcast to everyone
-  client  -- no simulation at all: send input, render the host's snapshots
-             interpolated between the two most recent
+  render, every frame (Kivy's display rate)
+      Read this device's controls, step the world, draw. In a networked run
+      the partner is *sampled* here too -- interpolation runs per frame, not
+      per packet, which is what turns 20 arrivals a second into 60 smooth
+      frames.
+
+  network, NET_TICK_HZ
+      Send this dino, drain what arrived. Nothing here draws and nothing here
+      simulates.
+
+Splitting them is not tidiness. Sending on the render loop ties packet rate to
+framerate -- a phone dropping to 40 fps quietly starts sending 40 snapshots a
+second -- and draining on it turns a burst of queued packets into a dropped
+frame, right when the network is already struggling.
+
+Two modes share the screen:
+
+  local     -- one or two dinos on this device, simulated here.
+  networked -- host and joiner take the SAME path. Each device simulates its
+               own dino from local input with nothing in the way, renders its
+               partners from their snapshots, and derives the obstacles from
+               the shared seed. See game/coop.py.
 """
 
 from __future__ import annotations
@@ -26,13 +43,12 @@ from kivy.uix.widget import Widget
 from kivy.utils import platform
 
 from game import constants as C
-from game import timing
-from game.entities import interpolate, select_pair
 from game.game_input import InputMapper
 from game.physics import rope_tension
 from game.renderer import Renderer
-from game.prediction import LocalPredictor
-from game.simulation import Simulation, make_players, modifiers_for
+from game.simulation import Simulation, make_players
+from net.peers import EXTRAP, STALE
+from net.statepacket import NET_TICK_HZ
 from ui import audio, theme
 from ui import format as fmt
 from ui.insets import insets
@@ -87,13 +103,13 @@ class GameScreen(Screen):
         self.sim: Simulation | None = None
         self.mapper: InputMapper | None = None
         self._event = None
+        # The network tick, scheduled separately from the render loop and at a
+        # fraction of its rate. See the module docstring.
+        self._net_event = None
         self._accumulator = 0.0
         self._mode = "local"
-        self._last_event_tick = -1
         self._dead_zone_top = theme.TOUCH_MIN * 2.0
         self._exit_dialog = None
-        # Client mode only: runs this device's own dino ahead of the network.
-        self._predictor = LocalPredictor()
         audio.preload()
 
         root = FloatLayout()
@@ -336,7 +352,8 @@ class GameScreen(Screen):
                 "P1:  SPACE / W = jump,  S = duck        "
                 "P2:  UP = jump,  DOWN = duck")
         else:
-            # Host and client both drive exactly one local dino.
+            # Host and joiner both drive exactly one local dino, on the same
+            # code path. The session was built by the app when START landed.
             self.sim = None
             self.mapper = InputMapper(1)
             self.hint_label.text = (
@@ -350,8 +367,10 @@ class GameScreen(Screen):
         self.mapper.dead_zone_top = self._dead_zone_top
         self.view.mapper = self.mapper  # touch zones -> local player 0
         self._accumulator = 0.0
-        self._last_event_tick = -1
         self._event = Clock.schedule_interval(self._frame, 0)
+        if self._mode != "local":
+            self._net_event = Clock.schedule_interval(self._net_tick,
+                                                      1.0 / NET_TICK_HZ)
 
     def _fade_hint(self) -> None:
         """Show the control reminder, then get it out of the way."""
@@ -376,24 +395,21 @@ class GameScreen(Screen):
         if self._event is not None:
             self._event.cancel()
             self._event = None
+        if self._net_event is not None:
+            self._net_event.cancel()
+            self._net_event = None
         if self.mapper is not None:
             self.mapper.unbind_keyboard()
             self.mapper = None
         self.view.mapper = None
-        # Never carry a prediction across runs: a rematch reseeds the world,
-        # and last run's dino would be blended into the new one.
-        self._predictor.stop()
 
     # -- the loop -----------------------------------------------------------
 
     def _frame(self, frame_dt: float) -> None:
-        app = App.get_running_app()
-        if self._mode == "client":
-            self._frame_client(app, frame_dt)
-        elif self._mode == "host":
-            self._frame_host(app, frame_dt)
-        else:
+        if self._mode == "local":
             self._frame_local(frame_dt)
+        else:
+            self._frame_coop(App.get_running_app(), frame_dt)
 
     def _frame_local(self, frame_dt: float) -> None:
         """Simulate locally with a fixed-timestep accumulator.
@@ -413,7 +429,12 @@ class GameScreen(Screen):
         self._accumulator += min(frame_dt, C.MAX_FRAME_DT)
         ticks = 0
         while self._accumulator >= C.TICK_DT and ticks < C.MAX_TICKS_PER_FRAME:
-            self.sim.step(C.TICK_DT)
+            # step() reports the power-ups touched rather than applying them,
+            # because in a networked run both devices have to start the effect
+            # on a tick they agree on. With one device there is nobody to agree
+            # with, so claiming and applying are the same instant.
+            for powerup in self.sim.step(C.TICK_DT):
+                self.sim.apply_powerup(powerup.kind, powerup.pid)
             self._accumulator -= C.TICK_DT
             ticks += 1
             if not self.sim.state.running:
@@ -427,142 +448,81 @@ class GameScreen(Screen):
         if not self.sim.state.running:
             self._end_local_run()
 
-    def _frame_host(self, app, frame_dt: float) -> None:
-        """The host simulates for everyone; its accumulator lives in GameHost."""
-        host = app.host if app else None
-        if host is None:
-            return
-        if self.mapper is not None:
-            local = self.mapper.states[0]
-            host.set_local_input(local.jump, local.duck)
+    def _frame_coop(self, app, frame_dt: float) -> None:
+        """One networked frame. Identical for the host and for a joiner.
 
-        was_running = host.running
-        host.tick(frame_dt)
-
-        if host.sim is not None:
-            self._present(host.sim.state, frame_dt)
-
-        if was_running and not host.running and host.sim is not None:
-            state = host.sim.state
-            self._teardown()
-            over = self.manager.get_screen(GAMEOVER)
-            over.show_result(
-                score=state.score, distance=state.distance,
-                cause_player_id=state.cause_player_id,
-                cause_obstacle=state.cause_obstacle,
-                players=len(state.players),
-                seconds=state.tick * C.TICK_DT,
-            )
-            self.manager.current = GAMEOVER
-
-    def _frame_client(self, app, frame_dt: float) -> None:
-        """Render the host's world, interpolated between two snapshots.
-
-        We deliberately render INTERP_DELAY in the past. That way there
-        is virtually always a newer snapshot to interpolate *toward*; rendering
-        at the newest packet instead would leave the world frozen every time
-        one arrived late.
+        The whole of this device's input handling is the two lines that read
+        the mapper and hand them to the session. There is no send here, no
+        wait, and no correction afterwards -- the dino this device owns is
+        moved by the press that moved it, on the frame it happened. That is
+        the fix for the joiner's lag, and it is not a fast path bolted on to a
+        slow one: it is the only path, and the host takes it too.
         """
-        if app is None or app.client is None:
+        session = app.session if app is not None else None
+        if session is None:
             return
 
         if self.mapper is not None:
             local = self.mapper.states[0]
-            # Every frame now, not just on change: over UDP the resend IS the
-            # reliability mechanism (client.send_input rate-limits to
-            # INPUT_HZ). The tick we last rendered rides along so the host can
-            # tell how far behind us this input was formed.
-            app.client.send_input(local.jump, local.duck,
-                                  tick=self._last_event_tick)
-            # The same input drives prediction immediately -- that is the
-            # whole point: the jump starts on this frame, not when the host's
-            # answer gets back.
-            self._predictor.set_input(local.jump, local.duck)
-        app.client.maybe_ping()
+            session.set_local_input(local.jump, local.duck)
 
-        snapshots = app.snapshots
-        if not snapshots:
-            return
+        state = session.advance(frame_dt)
+        self._present(state, frame_dt, events=session.frame_events)
 
-        # Fire each snapshot's events exactly once, as it arrives. Interpolated
-        # frames carry no events, so a crash cannot be replayed every frame
-        # while the view catches up to it.
-        pending: list[dict] = []
-        for _, snap in snapshots:
-            if snap.tick > self._last_event_tick:
-                pending.extend(snap.events)
-                self._last_event_tick = snap.tick
-        if pending:
-            self._fire_events(pending, snapshots[-1][1])
+        # Checked unconditionally rather than as a running -> stopped edge. A
+        # partner's death arrives on the app's message pump, which runs
+        # BETWEEN frames, so by the time this frame starts the run can already
+        # be over -- an edge test would see False on both sides and never fire.
+        # Firing once is guaranteed instead by _end_networked_run tearing down
+        # this callback.
+        if not session.running:
+            self._end_networked_run(state)
 
-        # Prediction runs on the newest authoritative word, not the delayed
-        # view: it is meant to be ahead of the network, not behind it. Its
-        # age matters as much as its contents -- see LocalPredictor._catch_up.
-        newest_at, newest = snapshots[-1]
-        self._advance_prediction(newest, timing.now() - newest_at, frame_dt)
+    def _net_tick(self, _dt: float) -> None:
+        """Send our dino and drain the inbound queue. NET_TICK_HZ, not 60.
 
-        # Render INTERP_DELAY in the past, so there is a snapshot on each side
-        # of this instant to interpolate between. Drawing the newest snapshot
-        # as it lands would move the world in snapshot-rate lurches across a
-        # faster screen; this trades a fixed delay for continuous motion.
-        target = timing.now() - C.INTERP_DELAY
-
-        pair = select_pair(snapshots, target)
-        if pair is None:
-            # No bracketing pair: we just joined, or the stream stalled for
-            # longer than the buffer holds. Showing the newest snapshot is a
-            # visible snap, so it is the fallback, never the normal path.
-            view = snapshots[-1][1]
-        else:
-            older, newer, t = pair
-            view = interpolate(older[1], newer[1], t,
-                               skip_ids=self._local_ids())
-
-        # Last word on the local dino: everyone else is the host's version,
-        # delayed and smoothed; yours is the one you are driving right now.
-        self._predictor.apply_to(view)
-        self._present(view, frame_dt)
-
-    def _advance_prediction(self, authoritative, age: float,
-                            frame_dt: float) -> None:
-        """Step the local dino forward, then ease it toward the host's truth."""
+        Scheduled apart from the render loop so neither can drag on the other:
+        a frame that runs long does not skip a snapshot, and a burst of arrived
+        packets is not drained in the middle of drawing one.
+        """
         app = App.get_running_app()
-        local_id = None
-        if app is not None and app.client is not None:
-            local_id = app.client.player_id
-        if local_id is None:
+        session = app.session if app is not None else None
+        if session is None:
             return
+        session.net_tick(app.state_inbox())
+        client = app.client
+        if client is not None:
+            client.maybe_ping()
+            if client.rtt is not None:
+                session.set_flight_time(client.rtt * 0.5)
 
-        auth = next((p for p in authoritative.players if p.id == local_id),
-                    None)
-        if auth is None:
-            self._predictor.stop()
-            return
-
-        if not self._predictor.active:
-            self._predictor.begin(auth)
-            return
-
-        mods = modifiers_for(authoritative.effects)
-        # Order matters: advance first, then correct. Correcting a prediction
-        # that has not yet accounted for this frame's input would blend away
-        # the jump before it was ever drawn.
-        self._predictor.step(frame_dt, mods)
-        self._predictor.reconcile(auth, age, mods)
-
-    def _local_ids(self) -> frozenset[int]:
-        """The player this device controls, who must not be interpolated."""
+    def _end_networked_run(self, state) -> None:
         app = App.get_running_app()
-        if app is None or app.client is None or app.client.player_id is None:
-            return frozenset()
-        return frozenset({app.client.player_id})
+        if app is not None:
+            app.on_run_ended(state)
+        self._teardown()
+        over = self.manager.get_screen(GAMEOVER)
+        over.show_result(
+            score=state.score, distance=state.distance,
+            cause_player_id=state.cause_player_id,
+            cause_obstacle=state.cause_obstacle,
+            players=len(state.players),
+            seconds=state.tick * C.TICK_DT,
+        )
+        self.manager.current = GAMEOVER
 
     # -- presentation -------------------------------------------------------
 
-    def _present(self, state, frame_dt: float = 0.0) -> None:
+    def _present(self, state, frame_dt: float = 0.0,
+                 events: list[dict] | None = None) -> None:
         # Juice is presentation-only, so it is driven here rather than in the
         # sim -- which keeps it out of the network state and out of physics.
-        self._consume_events(state)
+        #
+        # ``events`` is passed explicitly in a networked run: the session
+        # accumulates a whole frame's worth (its own ticks plus the partners'
+        # arrivals), where state.events only ever holds the last tick's. A
+        # frame that steps twice would otherwise drop the first tick's jump.
+        self._fire_events(events if events is not None else state.events, state)
         self.renderer.advance(frame_dt, state)
         self.renderer.draw(state)
 
@@ -614,29 +574,9 @@ class GameScreen(Screen):
         for kind, text in active:
             self._effect_badges[kind].text = text
 
-    def _consume_events(self, state) -> None:
-        # Clients fire events from arriving snapshots instead (see
-        # _frame_client), so only the locally simulated modes go through here.
-        if self._mode == "client" or not state.events:
-            return
-        self._fire_events(state.events, state)
-
-    def fire_reliable_events(self, events: list[dict]) -> None:
-        """Events the host sent over TCP because they must not be lost.
-
-        Only crashes take this path. They are stripped from the snapshot
-        stream host-side, so there is no risk of firing one twice.
-        """
+    def _fire_events(self, events: list[dict], state) -> None:
         if not events:
             return
-        app = App.get_running_app()
-        snapshots = app.snapshots if app is not None else None
-        if not snapshots:
-            audio.play_events(events)
-            return
-        self._fire_events(events, snapshots[-1][1])
-
-    def _fire_events(self, events: list[dict], state) -> None:
         audio.play_events(events)
         for event in events:
             if event.get("e") != "crash":
@@ -662,10 +602,29 @@ class GameScreen(Screen):
             plate.opacity = 1.0
 
     def _update_net_label(self) -> None:
+        """Say what the connection is doing, in words rather than milliseconds.
+
+        The partner-quality line takes priority over the latency readout when
+        it is not "live", because it answers the question the player is
+        actually asking. A dino that has stopped moving looks identical whether
+        its owner rage-quit or walked behind a wall, and "180 ms" does not
+        distinguish them either -- "partner connection unstable" does.
+        """
         app = App.get_running_app()
         if app is None or self._mode == "local":
             self.net_label.text = ""
             return
+
+        session = app.session
+        if session is not None:
+            quality = session.peer_quality()
+            if quality == STALE:
+                self.net_label.text = "Partner connection lost"
+                return
+            if quality == EXTRAP:
+                self.net_label.text = "Partner connection unstable"
+                return
+
         if self._mode == "host":
             count = app.host.player_count() if app.host else 1
             self.net_label.text = (f"Hosting - {count} player"

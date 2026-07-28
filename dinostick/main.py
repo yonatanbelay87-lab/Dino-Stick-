@@ -16,7 +16,6 @@ from __future__ import annotations
 import os
 import queue
 import sys
-from collections import deque
 
 # Allow `python main.py` from anywhere: put this directory on sys.path so the
 # flat package imports (game/, net/, screens/, ui/) resolve.
@@ -31,12 +30,13 @@ from kivy.uix.screenmanager import (FadeTransition, NoTransition,  # noqa: E402
                                     ScreenManager)
 
 from game import constants as C  # noqa: E402
-from game import timing  # noqa: E402
-from game.entities import snapshot_to_state  # noqa: E402
+from game.coop import CoopSession  # noqa: E402
+from game.entities import Player  # noqa: E402
 from net import protocol  # noqa: E402
 from net.client import GameClient  # noqa: E402
 from net.discovery import HostAnnouncer, get_local_ip  # noqa: E402
 from net.host import GameHost  # noqa: E402
+from net.peers import wrap_if_simulating  # noqa: E402
 from screens import GAME, GAMEOVER, LOADING, LOBBY, MENU  # noqa: E402
 from screens.game import GameScreen  # noqa: E402
 from screens.gameover import GameOverScreen  # noqa: E402
@@ -51,6 +51,19 @@ from ui.insets import insets  # noqa: E402
 MODE_LOCAL = "local"
 MODE_HOST = "host"
 MODE_CLIENT = "client"
+
+# Reliable messages that change the shared world. Everyone has to end up
+# applying the same set of these, so on the host they are both handled locally
+# and relayed on -- a joiner's death has to reach the OTHER joiners, and the
+# host is the only address they all have.
+_SHARED_EVENTS = frozenset({
+    protocol.MSG_POWERUP_CLAIM,
+    protocol.MSG_POWERUP,
+    protocol.MSG_DEATH,
+    protocol.MSG_REVIVE,
+    protocol.MSG_SHIELD,
+    protocol.MSG_SCORE_SYNC,
+})
 
 # Android delivers Back as keycode 27, the same as ESC.
 KEY_BACK = 27
@@ -106,16 +119,16 @@ class DinoStickApp(App):
         self.host: GameHost | None = None
         self.client: GameClient | None = None
         self.announcer: HostAnnouncer | None = None
+        # This device's half of a networked run. Host and joiner both get one,
+        # and they are the same class -- see game/coop.py.
+        self.session: CoopSession | None = None
 
         stored = settings.load(self.user_data_dir)
         self.player_name: str = stored["player_name"]
         self.skin: int = int(stored["skin"]) % len(C.SKIN_NAMES)
-        # id -> (name, skin), used to dress up the snapshots clients render.
+        # id -> (name, skin), for the nameplates over each dino.
         self.roster: dict[int, tuple[str, int]] = {}
         self.lobby_players: list[dict] = []
-
-        # Timestamped snapshots awaiting interpolation (client mode only).
-        self.snapshots: deque = deque(maxlen=C.SNAPSHOT_BUFFER)
         self.last_gameover: dict | None = None
 
         sm = ScreenManager(transition=self._transition())
@@ -225,13 +238,90 @@ class DinoStickApp(App):
         if self.client is not None:
             self.client.disconnect()
             self.client = None
-        self.snapshots.clear()
+        self.session = None
         self.roster.clear()
         self.lobby_players.clear()
         self.mode = MODE_LOCAL
 
     def local_ip(self) -> str:
         return get_local_ip()
+
+    # -- the co-op session ---------------------------------------------------
+
+    def host_start_game(self) -> None:
+        """Host: name a seed, tell everyone, and build our own session.
+
+        The host's session is built from exactly the same call the joiners'
+        are, with the same seed and the same countdown. There is no
+        "authoritative" variant of it -- if there were, the whole design would
+        have a fast path for whoever pressed Start and a slow one for everybody
+        else, which is the bug this replaced.
+        """
+        if self.host is None:
+            return
+        entries = self.host.start_game()
+        self.begin_session(self.host.seed, entries, C.HOST_PLAYER_ID,
+                           C.START_COUNTDOWN)
+
+    def begin_session(self, seed: int, entries: list[dict], local_id: int,
+                      countdown: float) -> None:
+        """Build this device's run from the seed everyone was given."""
+        self.roster = {int(e["id"]): (e["name"], int(e["skin"]))
+                       for e in entries}
+        players = [
+            Player(
+                id=int(e["id"]),
+                name=e["name"],
+                skin=int(e["skin"]),
+                x=C.PLAYER_START_X + index * C.PLAYER_SPACING_X,
+            )
+            for index, e in enumerate(entries)
+        ]
+
+        if self.mode == MODE_HOST and self.host is not None:
+            send_state = self.host.send_state
+            send_reliable = self.host.broadcast
+        elif self.client is not None:
+            send_state = self.client.send_state
+            send_reliable = self.client.send
+            self.client.begin_run()
+        else:
+            return
+
+        # NET_SIM_* only: normally this hands the sender straight back. When
+        # the knobs are on it wraps the OUTBOUND stream in drops and jitter,
+        # which is the honest place to inject them -- see net/peers.py.
+        self.session = CoopSession(
+            seed=seed,
+            players=players,
+            local_id=local_id,
+            send_state=wrap_if_simulating(send_state),
+            send_reliable=send_reliable,
+            is_host=self.mode == MODE_HOST,
+            countdown=countdown,
+        )
+
+    def state_inbox(self):
+        """The deque the receive thread is filling, whichever role we are."""
+        if self.mode == MODE_HOST and self.host is not None:
+            return self.host.state_inbox
+        if self.client is not None:
+            return self.client.state_inbox
+        return None
+
+    def on_run_ended(self, state) -> None:
+        """The game screen has finished a networked run.
+
+        The host publishes the final numbers so every device shows the same
+        card. Both computed the same score independently -- this settles the
+        last tick or two of difference rather than leaving two players staring
+        at scores that differ by 3.
+        """
+        if self.mode == MODE_HOST and self.host is not None:
+            self.host.broadcast(protocol.gameover(
+                state.score, state.distance,
+                state.cause_player_id, state.cause_obstacle))
+            self.host.end_game()
 
     # -- the pump -----------------------------------------------------------
 
@@ -255,6 +345,8 @@ class DinoStickApp(App):
             if kind in (protocol.MSG_JOIN, protocol.MSG_READY,
                         protocol.MSG_SKIN, "_disconnect"):
                 changed = True
+            elif kind in _SHARED_EVENTS:
+                self._on_shared_event(msg, relay=True)
 
         if changed and self.host is host:
             host.push_lobby()
@@ -282,15 +374,23 @@ class DinoStickApp(App):
                 break
             self._on_client_message(msg)
 
-        # The gameplay stream is drained separately: it arrives on its own
-        # socket and its own thread, and must not be held up behind control
-        # traffic (nor hold control traffic up).
-        while self.client is client:
-            try:
-                msg = client.udp_inbox.get_nowait()
-            except queue.Empty:
-                break
-            self._on_client_message(msg)
+        # The gameplay stream is NOT drained here. It arrives on its own socket
+        # and its own thread, and it is emptied by the game screen's 20 Hz net
+        # tick -- which is the point of having one. Draining it on the frame
+        # pump would put it right back on the render loop's critical path.
+
+    def _on_shared_event(self, msg: dict, relay: bool) -> None:
+        """Apply one shared-world event here, and pass it on if we are hosting.
+
+        A claim is the exception: it is a question addressed to the host, and
+        the host answers it with a POWERUP naming the tick. Relaying the
+        question would have every device try to answer it.
+        """
+        if self.session is not None:
+            self.session.on_reliable(msg)
+        if (relay and self.host is not None
+                and msg.get(protocol.TYPE) != protocol.MSG_POWERUP_CLAIM):
+            self.host.broadcast(msg)
 
     def _on_client_message(self, msg: dict) -> None:
         kind = msg.get(protocol.TYPE)
@@ -301,30 +401,36 @@ class DinoStickApp(App):
                            for p in self.lobby_players}
             self.sm.get_screen(LOBBY).refresh()
 
+        elif kind == protocol.MSG_SEED:
+            # The whole world, as one integer. START follows immediately and
+            # carries it again, so nothing is lost by treating this as
+            # informational -- it is here because a seed and a starting gun are
+            # different statements, and a future pre-run screen wants the first
+            # without the second.
+            pass
+
         elif kind == protocol.MSG_START:
             players = msg.get("players", [])
-            self.roster = {int(p["id"]): (p["name"], int(p["skin"]))
-                           for p in players}
-            self.snapshots.clear()
-            if self.client is not None:
-                self.client.begin_run()
+            you = (self.client.player_id if self.client is not None else None)
+            if you is None:
+                return  # no id yet: we cannot know which dino is ours
+            # The countdown is measured from when the host SENT this, so the
+            # flight time has already been spent. Subtracting it is what makes
+            # both devices reach tick 0 together rather than a trip apart.
+            countdown = float(msg.get("countdown", 0.0))
+            if self.client is not None and self.client.rtt is not None:
+                countdown -= self.client.rtt * 0.5
+            self.begin_session(int(msg.get("seed", 0)), players, you,
+                               max(0.0, countdown))
             self.sm.current = GAME
 
-        elif kind == protocol.MSG_EVENT:
-            # Crashes, delivered reliably over TCP rather than left to the
-            # snapshot stream. Handed to the game screen to fire once.
-            self.sm.get_screen(GAME).fire_reliable_events(
-                msg.get("events", []))
-
-        elif kind == protocol.MSG_STATE:
-            state = snapshot_to_state(msg, self.roster)
-            self.snapshots.append((timing.now(), state))
+        elif kind in _SHARED_EVENTS:
+            self._on_shared_event(msg, relay=False)
 
         elif kind == protocol.MSG_GAMEOVER:
             cause = msg.get("cause") or {}
-            # Run length is not on the wire; the last snapshot we rendered
-            # carries the tick it ended on, which is the same number.
-            ticks = self.snapshots[-1][1].tick if self.snapshots else None
+            ticks = (self.session.state.tick if self.session is not None
+                     else None)
             self.last_gameover = {
                 "score": int(msg.get("score", 0)),
                 "distance": float(msg.get("distance", 0.0)),
@@ -333,11 +439,14 @@ class DinoStickApp(App):
                 "players": len(self.roster) or 1,
                 "seconds": None if ticks is None else ticks * C.TICK_DT,
             }
+            # Usually a correction rather than news: this device ended its own
+            # run the moment it heard about the death, and is already looking
+            # at this card. The host's numbers settle the last tick or two of
+            # difference so both players read the same score.
             self.sm.get_screen(GAMEOVER).show_result(**self.last_gameover)
             self.sm.current = GAMEOVER
 
         elif kind == protocol.MSG_REMATCH:
-            self.snapshots.clear()
             if self.client is not None:
                 self.client.begin_run()
 

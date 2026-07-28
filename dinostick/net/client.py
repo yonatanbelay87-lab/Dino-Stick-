@@ -1,17 +1,23 @@
-"""TCP game client: sends local input, receives host state into a Queue.
+"""The joiner's transport. A TCP control channel and a UDP state stream.
 
-The receive thread never touches Kivy and never touches the renderer -- it
-decodes frames and enqueues dicts. The Kivy Clock loop drains ``inbox`` each
-frame, keeps the last two state snapshots, and renders an interpolation
-between them.
+Symmetrical with the host in every way that matters: this device simulates its
+own dino, sends the result 20 times a second, and receives everyone else's. It
+never sends an input and never waits for a reply before moving. The word
+"client" survives only because somebody has to dial and somebody has to answer.
+
+Neither receive thread touches Kivy, the renderer, or the game. The TCP thread
+decodes frames into a Queue; the UDP thread appends raw 15-byte payloads and
+their arrival time to a deque. The Kivy Clock drains both -- reliable messages
+every frame, state packets at NET_TICK_HZ.
 """
 
 from __future__ import annotations
 
 import queue
-import random
+import selectors
 import socket
 import threading
+from collections import deque
 from typing import Any
 
 from game import constants as C
@@ -19,6 +25,11 @@ from game import timing
 
 from . import protocol
 from .protocol import FrameReader, ProtocolError  # noqa: F401 -- re-exported
+from .statepacket import MSG_STATE, STATE_SIZE
+
+# How long the UDP thread parks on the selector before rechecking the stop
+# flag. The socket is non-blocking; this is what keeps the thread off the CPU.
+_SELECT_TIMEOUT = 0.5
 
 
 class GameClient:
@@ -26,6 +37,12 @@ class GameClient:
 
     def __init__(self, name: str = "Player", skin: int = 1) -> None:
         self.inbox: queue.Queue = queue.Queue()
+        # Raw state datagrams: (payload, received_at). Stamped here, on
+        # arrival, with our own clock -- never with the sender's. Two phones
+        # agree on nothing about wall time, and interpolating against arrival
+        # times means they never have to (see net/peers.py).
+        self.state_inbox: deque = deque(maxlen=256)
+
         self.name = name
         self.skin = skin
 
@@ -44,29 +61,26 @@ class GameClient:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._send_lock = threading.Lock()
-        self._seq = 0
-
-        # Last input actually sent, so the TCP path only resends on change.
-        self._last_input: tuple[bool, bool] | None = None
 
         # -- gameplay stream (UDP) ------------------------------------------
         self._udp: socket.socket | None = None
         self._udp_thread: threading.Thread | None = None
         self._host_endpoint: tuple[str, int] | None = None
-        self._state_seq = protocol.SeqFilter()
-        self._last_input_sent = 0.0
         # Registration is a single datagram, and a single datagram can be
-        # lost. Until the first snapshot arrives we keep re-announcing
-        # ourselves, otherwise one unlucky packet means a frozen world.
+        # lost. Until the first state packet arrives we keep re-announcing
+        # ourselves, otherwise one unlucky packet means a partner who never
+        # moves.
         self._registered = False
         self._last_register = 0.0
-        # Snapshots land here from the UDP thread; the Kivy loop drains it.
-        self.udp_inbox: queue.Queue = queue.Queue()
 
     # -- lifecycle ----------------------------------------------------------
 
     def connect(self, ip: str, port: int = C.PORT_GAME) -> None:
-        """Blocking connect. Raises OSError if the host is unreachable."""
+        """Blocking connect. Raises OSError if the host is unreachable.
+
+        The only blocking socket call in the client, and it happens on a menu
+        button press rather than during a run.
+        """
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(C.SOCKET_TIMEOUT)
         sock.connect((ip, port))
@@ -81,11 +95,10 @@ class GameClient:
         self._thread.start()
         self.send(protocol.join(self.name, self.skin))
 
-        if C.USE_UDP_GAMEPLAY:
-            self._start_udp(ip)
+        self._start_udp(ip)
 
     def _start_udp(self, host_ip: str) -> None:
-        """Open the gameplay socket. Best effort -- TCP still carries the game.
+        """Open the gameplay socket. Best effort -- see MSG_STATE_TCP.
 
         The port is ephemeral: only the host needs a well-known one, and
         binding a fixed port here would stop two clients sharing a machine,
@@ -94,7 +107,7 @@ class GameClient:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.bind(("", 0))
-            sock.settimeout(0.5)
+            sock.setblocking(False)
         except OSError:
             self._udp = None
             return
@@ -105,34 +118,40 @@ class GameClient:
         self._udp_thread.start()
 
     def _udp_loop(self) -> None:
-        """Receive snapshots. Own thread, no Kivy, no rendering, no blocking."""
-        while not self._stop.is_set():
-            sock = self._udp
-            if sock is None:
-                return
-            try:
-                data, _addr = sock.recvfrom(2048)
-            except (socket.timeout, TimeoutError):
-                continue
-            except OSError:
-                return
-            if (C.SIMULATED_PACKET_LOSS > 0.0
-                    and random.random() < C.SIMULATED_PACKET_LOSS):
-                continue  # deliberately dropped; see SIMULATED_PACKET_LOSS
-            msg = protocol.unpack(data)
-            if msg is None or msg.get(protocol.TYPE) != protocol.MSG_STATE:
-                continue
-            try:
-                seq = int(msg.get("seq", 0))
-            except (TypeError, ValueError):
-                continue
-            # Older than what we already have: throw it away rather than
-            # rendering backwards. We never wait for a gap to be filled.
-            if not self._state_seq.accept(seq):
-                continue
-            self._registered = True
-            self._last_rx = timing.now()
-            self.udp_inbox.put(msg)
+        """Receive state packets. Own thread, non-blocking socket, no decode.
+
+        The packet is not parsed here and the seq is not checked here. Both
+        happen on the Kivy thread when the buffer is drained, which keeps this
+        loop to "append two values to a deque" -- there is nothing in it that
+        can throw, and nothing that can take long enough to make the next
+        packet wait.
+        """
+        sock = self._udp
+        if sock is None:
+            return
+        selector = selectors.DefaultSelector()
+        try:
+            selector.register(sock, selectors.EVENT_READ)
+        except (OSError, ValueError):
+            return
+        try:
+            while not self._stop.is_set():
+                if not selector.select(_SELECT_TIMEOUT):
+                    continue
+                while True:
+                    try:
+                        data, _addr = sock.recvfrom(2048)
+                    except BlockingIOError:
+                        break
+                    except OSError:
+                        return
+                    if len(data) != STATE_SIZE or data[0] != MSG_STATE:
+                        continue  # not ours: a stray broadcast on the subnet
+                    self._registered = True
+                    self._last_rx = timing.now()
+                    self.state_inbox.append((data, self._last_rx))
+        finally:
+            selector.close()
 
     def _recv_loop(self) -> None:
         reader = FrameReader()
@@ -161,12 +180,22 @@ class GameClient:
                             self.player_id = int(msg.get("you", 0))
                         elif kind == protocol.MSG_PONG:
                             # Both timestamps come from OUR clock, so this is a
-                            # true RTT with no clock-sync needed. Smoothed so a
+                            # true RTT with no clock sync needed. Smoothed so a
                             # single hiccup does not make the readout jump.
                             sample = timing.now() - float(msg.get("t", 0.0))
                             self.rtt = (sample if self.rtt is None
                                         else self.rtt * 0.7 + sample * 0.3)
                             continue  # never surfaced to the game layer
+                        elif kind == protocol.MSG_STATE_TCP:
+                            # UDP was unavailable at one end. Route it to the
+                            # same buffer the datagrams would have landed in,
+                            # so nothing downstream has to know.
+                            try:
+                                payload = bytes.fromhex(str(msg.get("b", "")))
+                            except ValueError:
+                                continue
+                            self.state_inbox.append((payload, timing.now()))
+                            continue
                         self.inbox.put(msg)
                 except ProtocolError:
                     break
@@ -195,10 +224,12 @@ class GameClient:
         if self._thread is not None:
             self._thread.join(timeout=1.0)
             self._thread = None
+        self.state_inbox.clear()
 
     # -- sending ------------------------------------------------------------
 
     def send(self, msg: dict[str, Any]) -> None:
+        """Send one reliable message. Rare by construction -- see protocol.py."""
         if self._sock is None or not self.connected:
             return
         try:
@@ -208,57 +239,31 @@ class GameClient:
             self.error = str(exc)
             self.connected = False
 
-    def maybe_ping(self) -> None:
-        """Send a latency probe at most once per PING_INTERVAL.
+    def send_state(self, payload: bytes) -> None:
+        """Send our dino to the host, which relays it to everyone else.
 
-        Called from every screen, not just in game: the reply is what keeps
-        both ends' keepalive clocks fresh, and a lobby is exactly where you sit
-        long enough for a phone to wander off the network.
+        Fire and forget. No sequencing beyond the seq inside the packet, no
+        acknowledgement, no retry: a lost snapshot is superseded 50 ms later,
+        and blocking the Kivy thread to make sure one arrived would cost more
+        than the packet was worth.
         """
-        now = timing.now()
-        if now - self._last_ping < C.PING_INTERVAL:
+        if self._udp is None or self._host_endpoint is None:
+            self.send(protocol.state_tcp(payload))
             return
-        self._last_ping = now
-        self.send(protocol.ping(now))
-
-    def send_input(self, jump: bool, duck: bool, tick: int = 0,
-                   force: bool = False) -> None:
-        """Send the current input state to the host.
-
-        Over UDP this fires at INPUT_HZ regardless of whether anything
-        changed. That looks wasteful next to the TCP path -- which sent one
-        message per keypress -- but a packet is 72 bytes and, more to the
-        point, an unacknowledged change-only message that gets dropped is a
-        jump the host never hears about. Resending is the reliability
-        mechanism. It is safe because the host detects a rising edge per tick,
-        so a repeated jump:true cannot produce a second hop.
-        """
-        if self._udp is not None and self._host_endpoint is not None:
-            now = timing.now()
-            if not force and now - self._last_input_sent < 1.0 / C.INPUT_HZ:
-                return
-            self._last_input_sent = now
-            self._seq += 1
-            self._maybe_register(now)
-            try:
-                self._udp.sendto(
-                    protocol.pack(protocol.player_input(jump, duck, self._seq,
-                                                        tick)),
-                    self._host_endpoint)
-            except (OSError, ProtocolError):
-                pass  # the next packet is 16ms away; never block the frame
-            return
-
-        # TCP fallback: reliable, so only send on change.
-        current = (jump, duck)
-        if not force and current == self._last_input:
-            return
-        self._last_input = current
-        self._seq += 1
-        self.send(protocol.player_input(jump, duck, self._seq, tick))
+        self._maybe_register(timing.now())
+        try:
+            self._udp.sendto(payload, self._host_endpoint)
+        except OSError:
+            pass  # the next one is 50 ms away; never block the frame
 
     def _maybe_register(self, now: float) -> None:
-        """Re-announce our UDP endpoint until snapshots start arriving."""
+        """Re-announce our UDP endpoint until packets start arriving.
+
+        The host cannot answer a datagram it has never received: it knows our
+        TCP socket, which says nothing about which ephemeral port our UDP
+        socket landed on. One registration datagram would do it, and one
+        datagram can be lost.
+        """
         if self._registered or self.player_id is None:
             return
         if now - self._last_register < C.UDP_REGISTER_INTERVAL:
@@ -271,19 +276,22 @@ class GameClient:
         except (OSError, ProtocolError, AssertionError):
             pass
 
-    def begin_run(self) -> None:
-        """Reset the gameplay stream for a new run.
+    def maybe_ping(self) -> None:
+        """Send a latency probe at most once per PING_INTERVAL.
 
-        Sequence numbers restart at zero on the host, so last run's filter
-        would reject this run's first snapshots outright.
+        Called from every screen, not just in game: the reply is what keeps
+        both ends' keepalive clocks fresh, and a lobby is exactly where you sit
+        long enough for a phone to wander off the network. The measurement also
+        feeds the world-clock sync (CoopSession.set_flight_time).
         """
-        self._state_seq.reset()
+        now = timing.now()
+        if now - self._last_ping < C.PING_INTERVAL:
+            return
+        self._last_ping = now
+        self.send(protocol.ping(now))
+
+    def begin_run(self) -> None:
+        """Reset the gameplay stream for a new run."""
         self._registered = False
         self._last_register = 0.0
-        self._last_input = None
-        self._seq = 0
-        while not self.udp_inbox.empty():
-            try:
-                self.udp_inbox.get_nowait()
-            except queue.Empty:
-                break
+        self.state_inbox.clear()

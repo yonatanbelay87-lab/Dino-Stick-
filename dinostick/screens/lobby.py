@@ -376,7 +376,9 @@ class LobbyScreen(Screen):
     def _start(self) -> None:
         app = App.get_running_app()
         if app.mode == "host" and app.host is not None:
-            app.host.start_game()
+            # Sends SEED + START and builds the host's own session from the
+            # same seed everyone else gets.
+            app.host_start_game()
         self.manager.current = GAME
 
     def _back(self) -> None:

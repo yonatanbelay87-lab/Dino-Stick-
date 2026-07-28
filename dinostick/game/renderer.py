@@ -401,8 +401,16 @@ class Renderer:
         skin = C.SKINS[player.skin % len(C.SKINS)]
         base = skin["color"] if player.alive else C.COLOR_DANGER
 
+        # A partner whose state stream has gone quiet is drawn faded. Without
+        # it, a dino frozen by a lost connection is indistinguishable from a
+        # dino whose owner is simply standing still -- and the two call for
+        # opposite reactions from the player holding the other end of the rope.
+        # The rope has already gone slack for them (see physics), so this is
+        # what explains why.
+        fade = 1.0 if player.connected else C.DISCONNECTED_FADE
+
         for part in skin["parts"]:
-            Color(*_shade(base, part.get("s", 1.0)))
+            Color(*_shade(base, part.get("s", 1.0) * fade))
             if part["k"] == "tri":
                 p = part["p"]
                 points: list[float] = []

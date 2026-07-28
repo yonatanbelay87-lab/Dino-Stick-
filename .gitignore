@@ -5,3 +5,15 @@ __pycache__/
 # Buildozer
 .buildozer/
 bin/
+
+# Signing material. NEVER commit any of this.
+#
+# The release keystore is the app's identity: whoever holds it can publish an
+# update that Android accepts as genuinely yours. It also cannot be replaced --
+# lose it and no future build can ever update an installed copy. Keep it backed
+# up somewhere private and out of git.
+*.jks
+*.keystore
+*.p12
+keystore.b64
+key.properties

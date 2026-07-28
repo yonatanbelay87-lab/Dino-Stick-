@@ -44,9 +44,23 @@ class Player:
     ducking: bool = False
     alive: bool = True
 
-    # Input latched for the current tick (host applies the latest it has).
+    # Input latched for the current tick, read straight off this device's
+    # keyboard or touch zones for the dino it owns.
     want_jump: bool = False
     want_duck: bool = False
+
+    # True for a dino owned by another device. Remote dinos are PUPPETS here:
+    # their position is written from the peer's own snapshots every frame and
+    # this device never integrates them. They are still full participants in
+    # the rope, which reads their y and vy -- it just does not get to move
+    # them, because the only authority on where they are is the device whose
+    # player is holding the controls.
+    remote: bool = False
+
+    # Cleared when a peer's state stream goes quiet (PEER_ROPE_TIMEOUT). A
+    # disconnected dino's rope goes slack: a frozen partner that still pulls is
+    # a frozen partner that drags the team into the next cactus.
+    connected: bool = True
 
     # Jump is edge-triggered: holding the key down must not auto-hop, so the
     # sim compares want_jump against its value last tick.
@@ -136,188 +150,16 @@ class GameState:
 
 
 # ---------------------------------------------------------------------------
-# Network snapshots
+# Network
 # ---------------------------------------------------------------------------
 #
-# The host broadcasts a trimmed view of GameState. Two things are deliberately
-# left out because clients can reconstruct them and they would otherwise be
-# resent 30 times a second:
-#   * player x -- fixed per slot, derived from the player's id
-#   * name / skin -- cosmetic, delivered once in the lobby/start message
-
-
-def state_to_snapshot(state: GameState) -> dict:
-    """Serialise the authoritative state into the ``state`` message payload."""
-    return {
-        "tick": state.tick,
-        "players": [
-            {
-                "id": p.id,
-                "y": round(p.y, 2),
-                "vy": round(p.vy, 2),
-                "grounded": p.grounded,
-                "ducking": p.ducking,
-                "alive": p.alive,
-            }
-            for p in state.players
-        ],
-        "obstacles": [
-            {"oid": o.oid, "x": round(o.x, 2), "y": round(o.y, 2), "type": o.kind}
-            for o in state.obstacles
-        ],
-        "powerups": [
-            {"pid": pu.pid, "x": round(pu.x, 2), "y": round(pu.y, 2),
-             "type": pu.kind}
-            for pu in state.powerups
-        ],
-        "score": state.score,
-        "distance": round(state.distance, 1),
-        "speed": round(state.speed, 2),
-        "effects": [{"kind": k, "remaining": round(v, 2)}
-                    for k, v in state.effects.items()],
-        "shield": state.shield,
-    }
-
-
-def snapshot_to_state(snap: dict, roster: dict[int, tuple[str, int]] | None = None
-                      ) -> GameState:
-    """Rebuild a renderable GameState from a ``state`` payload."""
-    roster = roster or {}
-    players = []
-    for entry in snap.get("players", []):
-        pid = int(entry["id"])
-        name, skin = roster.get(pid, (f"P{pid + 1}", pid))
-        players.append(
-            Player(
-                id=pid,
-                name=name,
-                skin=skin,
-                x=C.PLAYER_START_X + pid * C.PLAYER_SPACING_X,
-                y=float(entry["y"]),
-                vy=float(entry.get("vy", 0.0)),
-                grounded=bool(entry.get("grounded", True)),
-                ducking=bool(entry.get("ducking", False)),
-                alive=bool(entry.get("alive", True)),
-            )
-        )
-    obstacles = [
-        Obstacle(x=float(o["x"]), y=float(o.get("y", 0.0)),
-                 kind=o["type"], oid=int(o.get("oid", 0)))
-        for o in snap.get("obstacles", [])
-    ]
-    powerups = [
-        PowerUp(x=float(p["x"]), y=float(p.get("y", 0.0)), kind=p["type"],
-                pid=int(p.get("pid", 0)))
-        for p in snap.get("powerups", [])
-    ]
-    return GameState(
-        tick=int(snap.get("tick", 0)),
-        players=players,
-        obstacles=obstacles,
-        powerups=powerups,
-        score=int(snap.get("score", 0)),
-        distance=float(snap.get("distance", 0.0)),
-        speed=float(snap.get("speed", C.BASE_SPEED)),
-        effects={e["kind"]: float(e["remaining"])
-                 for e in snap.get("effects", [])},
-        shield=bool(snap.get("shield", False)),
-        events=list(snap.get("events", [])),
-        running=True,
-    )
-
-
-def _lerp(a: float, b: float, t: float) -> float:
-    return a + (b - a) * t
-
-
-def select_pair(snapshots, target: float):
-    """Find the two buffered snapshots that bracket ``target``.
-
-    Returns ``(older, newer, t)`` with t running 0..1 between their arrival
-    times, or ``None`` when the target falls outside everything buffered --
-    which means the caller has to show the newest snapshot as-is and accept a
-    visible snap.
-
-    Pulled out of the render loop so the delay and buffer size can be swept
-    against recorded arrival patterns without standing up a window. Tuning
-    INTERP_DELAY_MS by eye is how you end up with a number nobody can defend.
-    """
-    for i in range(len(snapshots) - 1):
-        older, newer = snapshots[i], snapshots[i + 1]
-        if older[0] <= target <= newer[0]:
-            span = newer[0] - older[0]
-            t = 0.0 if span <= 0 else (target - older[0]) / span
-            return older, newer, t
-    return None
-
-
-def interpolate(older: GameState, newer: GameState, t: float,
-                skip_ids: frozenset[int] | set[int] = frozenset()
-                ) -> GameState:
-    """Blend two snapshots for smooth client rendering.
-
-    ``t`` runs 0 (show ``older``) to 1 (show ``newer``). Players are matched by
-    id and obstacles by ``oid``; anything present in only one of the two
-    snapshots is taken as-is rather than blended, which is what stops obstacles
-    from sliding in from the wrong place as they spawn and despawn.
-
-    ``skip_ids`` names players that must not be blended -- in practice, the
-    one you are controlling. Interpolation renders the past, and the past is
-    the one place your own dino must never be: you press jump and expect to
-    leave the ground now, not INTERP_DELAY_MS from now. That player is drawn
-    from prediction instead (see the client-side prediction in screens/game).
-    """
-    t = max(0.0, min(1.0, t))
-
-    old_players = {p.id: p for p in older.players}
-    players = []
-    for new in newer.players:
-        old = old_players.get(new.id)
-        if old is None or new.id in skip_ids:
-            players.append(new)
-            continue
-        blended = Player(
-            id=new.id, name=new.name, skin=new.skin, x=new.x,
-            y=_lerp(old.y, new.y, t),
-            vy=_lerp(old.vy, new.vy, t),
-            grounded=new.grounded, ducking=new.ducking, alive=new.alive,
-        )
-        players.append(blended)
-
-    old_obstacles = {o.oid: o for o in older.obstacles}
-    obstacles = []
-    for new in newer.obstacles:
-        old = old_obstacles.get(new.oid)
-        if old is None or new.oid == 0:
-            obstacles.append(new)
-        else:
-            obstacles.append(
-                Obstacle(x=_lerp(old.x, new.x, t), y=new.y,
-                         kind=new.kind, oid=new.oid)
-            )
-
-    # Events are one-shot triggers for sound and particles, never blended --
-    # firing the newer snapshot's events once, as it becomes current, is what
-    # keeps a crash from being played twice.
-    old_powerups = {p.pid: p for p in older.powerups}
-    powerups = []
-    for new in newer.powerups:
-        old = old_powerups.get(new.pid)
-        if old is None or new.pid == 0:
-            powerups.append(new)
-        else:
-            powerups.append(PowerUp(x=_lerp(old.x, new.x, t), y=new.y,
-                                    kind=new.kind, pid=new.pid))
-
-    return GameState(
-        tick=newer.tick,
-        players=players,
-        obstacles=obstacles,
-        powerups=powerups,
-        score=newer.score,
-        distance=newer.distance,
-        speed=newer.speed,
-        effects=newer.effects,
-        shield=newer.shield,
-        running=newer.running,
-    )
+# There is deliberately no state_to_snapshot / snapshot_to_state pair here any
+# more, and no interpolate(). Those served the host-authoritative model, where
+# one device serialised the whole world -- obstacles, power-ups, score, every
+# player -- and the others rendered a blend of the last two copies of it.
+#
+# Under peer authority there is no whole world to serialise. Each device sends
+# only its own dino, as 15 packed bytes (net/statepacket.py), and the obstacles
+# both devices see come from the shared seed rather than from the wire.
+# Partner interpolation moved to net/peers.py, where it operates on those
+# packets instead of on GameState.

@@ -107,6 +107,14 @@ def apply_rope_forces(players: list[Player], dt: float,
         left = players[i]
         right = players[i + 1]
 
+        # A peer whose state stream has gone quiet is a dino frozen at its last
+        # known height, and a frozen dino is an infinitely strong anchor: the
+        # spring pulls against a partner that can never move toward you, so the
+        # rope quietly becomes a tow rope to a lamp post. Going slack instead
+        # means losing a player costs the team their help, not their run.
+        if not (left.connected and right.connected):
+            continue
+
         dy = right.y - left.y
         dvy = right.vy - left.vy
 
@@ -130,5 +138,8 @@ def rope_tension(players: list[Player], index: int) -> float:
     """
     if index + 1 >= len(players):
         return 0.0
-    dy = abs(players[index + 1].y - players[index].y)
+    left, right = players[index], players[index + 1]
+    if not (left.connected and right.connected):
+        return 0.0  # slack, per apply_rope_forces -- the meter must agree
+    dy = abs(right.y - left.y)
     return min(1.0, dy / C.MAX_STRETCH)

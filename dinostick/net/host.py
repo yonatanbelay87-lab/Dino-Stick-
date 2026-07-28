@@ -1,38 +1,54 @@
-"""TCP game server. Owns the simulation and broadcasts state to all clients.
+"""The host's transport. Accepts clients, relays, and arbitrates -- nothing else.
+
+This used to own the simulation and hand everyone else a copy of it. It does
+not any more. Every device, host included, runs its own ``CoopSession`` against
+the shared seed (game/coop.py), so what is left here is the plumbing:
+
+  * a TCP listener and one reader thread per client, for the reliable channel;
+  * a UDP socket and one receive thread, for the 15-byte state stream;
+  * a relay, because in a 3- or 4-player room joiner A's snapshots have to
+    reach joiner B and the only address B is guaranteed to know is the host's;
+  * the lobby roster, and the seed.
 
 Threading model:
-  * one accept thread, one reader thread per client -- these only ever decode
-    frames and push dicts into ``inbox``;
-  * the *caller's* clock drives ``tick()``, which is where the simulation
-    advances and state goes out.
+  * accept thread, one reader thread per client, one UDP thread -- these only
+    ever decode and enqueue;
+  * everything that touches the game or a widget happens on the Kivy thread,
+    draining those queues.
 
-That last point is deliberate. The host owns the Simulation object, but it does
-not own a clock: the Kivy layer calls ``tick(dt)`` from its Clock callback, so
-the simulation only ever runs on the main thread. Nothing needs a lock around
-sim state, and no socket thread can touch a widget.
+The host's own player is simply player 0. It has no more authority over its own
+dino than any joiner has over theirs, which is the entire point: the code path
+that runs a run is the same whether you hosted it or joined it.
 
-The host's own player is simply player 0 -- there is no special-casing, which
-keeps the sim identical whether you host or join.
+What the host DOES still decide is the handful of events that change the shared
+world -- which power-up counts, and when. That is arbitration, not simulation:
+it names a tick, and every device (including this one) applies the effect there.
 """
 
 from __future__ import annotations
 
 import queue
 import random
+import selectors
 import socket
 import threading
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
 from game import constants as C
 from game import timing
-from game.entities import Player, state_to_snapshot
-from game.simulation import Simulation
 
 from . import protocol
 from .protocol import FrameReader, ProtocolError
+from .statepacket import MSG_STATE, STATE_SIZE
 
-HOST_PLAYER_ID = 0
+HOST_PLAYER_ID = C.HOST_PLAYER_ID
+
+# How long the UDP thread waits on the selector before looking at the stop
+# flag again. The socket itself is non-blocking; this is what stops the thread
+# spinning a core while nothing is arriving.
+_SELECT_TIMEOUT = 0.5
 
 
 @dataclass
@@ -53,19 +69,24 @@ class ClientConn:
 
 
 class GameHost:
-    """Accepts clients, assigns ids, drives the authoritative simulation."""
+    """Accepts clients, assigns ids, relays the state stream, names the seed."""
 
     def __init__(self, name: str = "Player 1", port: int = C.PORT_GAME) -> None:
-        # Decoded inbound messages for the Kivy layer to drain on the main
-        # thread: (client_id, message) or (client_id, {"type": "_disconnect"}).
+        # Decoded inbound reliable messages for the Kivy layer to drain on the
+        # main thread: (client_id, message) or (client_id, {"type":
+        # "_disconnect"}).
         self.inbox: queue.Queue = queue.Queue()
+        # Raw state datagrams: (payload, received_at). A deque rather than a
+        # Queue because the consumer wants *everything* pending in one go at
+        # 20 Hz, and popleft-until-IndexError is cheaper than Queue's
+        # per-item locking for a stream this hot.
+        self.state_inbox: deque = deque(maxlen=256)
 
         self.port = port
         self.host_name = name
         self.host_skin = 0
         self.host_ready = True  # the host is always ready; they press Start
 
-        self.sim: Simulation | None = None
         self.seed: int = 0
         self.running = False
 
@@ -73,30 +94,16 @@ class GameHost:
         self._accept_thread: threading.Thread | None = None
         self._stop = threading.Event()
 
-        # The gameplay stream. Snapshots go out from the main thread via
-        # sendto(); inputs arrive on a dedicated reader thread.
+        # The gameplay stream. Snapshots go out from the Kivy thread via
+        # sendto(); everyone else's arrive on a dedicated receive thread.
         self._udp: socket.socket | None = None
         self._udp_thread: threading.Thread | None = None
         # player id -> (ip, port) learned from that client's udp_register.
         self._udp_endpoints: dict[int, tuple[str, int]] = {}
-        # Per-sender sequence filters, so a reordered input cannot undo a
-        # newer one. Keyed by player id.
-        self._input_seq: dict[int, protocol.SeqFilter] = {}
-        self._snapshot_seq = 0
 
         self._clients: dict[int, ClientConn] = {}
         self._lock = threading.Lock()
         self._next_id = HOST_PLAYER_ID + 1
-
-        # Latest input per player id, applied at the top of each tick.
-        self._inputs: dict[int, tuple[bool, bool]] = {}
-
-        self._accumulator = 0.0
-        self._broadcast_timer = 0.0
-        # Sim events pile up here between broadcasts. Ticks run at 60 Hz but
-        # state goes out at SNAPSHOT_HZ, so reading state.events at broadcast time
-        # drop half the jumps and lands on the clients.
-        self._event_buffer: list[dict] = []
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -112,22 +119,26 @@ class GameHost:
                                                daemon=True,
                                                name="dinostick-accept")
         self._accept_thread.start()
-
-        if C.USE_UDP_GAMEPLAY:
-            self._start_udp()
+        self._start_udp()
 
     def _start_udp(self) -> None:
         """Bind the gameplay socket. Failure here is not fatal.
 
         If the UDP port is taken -- a second host on this machine, or another
-        program squatting on it -- the game still works: with no registered
-        endpoints, snapshots fall back to TCP in ``_send_snapshot``.
+        program squatting on it -- the game still runs: with no socket, state
+        packets fall back to the TCP channel in ``send_state``. That is a worse
+        experience (head-of-line blocking on a dropped packet is exactly what
+        the UDP path exists to avoid) but it is a game rather than an error.
         """
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(("", C.PORT_GAME_UDP))
-            sock.settimeout(0.5)
+            # Non-blocking, and then parked on a selector below. Belt and
+            # braces: nothing on this socket may ever block, and a recvfrom
+            # that somehow ran on the wrong thread would return immediately
+            # rather than stalling a frame.
+            sock.setblocking(False)
         except OSError:
             self._udp = None
             return
@@ -148,7 +159,7 @@ class GameHost:
             self._udp_thread.join(timeout=1.0)
             self._udp_thread = None
         self._udp_endpoints.clear()
-        self._input_seq.clear()
+        self.state_inbox.clear()
         with self._lock:
             clients = list(self._clients.values())
             self._clients.clear()
@@ -235,31 +246,67 @@ class GameHost:
     # -- UDP gameplay stream -------------------------------------------------
 
     def _udp_loop(self) -> None:
-        """Decode inbound datagrams. Runs on its own thread, touches no widget.
+        """Receive state packets. Own thread, non-blocking socket, no widgets.
 
-        Deliberately does no work beyond parsing and a dict write: the input
-        table is read by the simulation on the main thread, and a tuple
-        assignment into a dict is atomic under the GIL, so neither side needs
-        a lock and neither can stall the other.
+        Deliberately does almost nothing: queue the payload for the Kivy thread
+        and, in a room of three or more, forward it to the other clients. The
+        decode happens where the game is, so a malformed packet cannot take
+        down the receive thread and a burst cannot stall it.
         """
-        while not self._stop.is_set():
-            sock = self._udp
-            if sock is None:
-                return
+        sock = self._udp
+        if sock is None:
+            return
+        selector = selectors.DefaultSelector()
+        try:
+            selector.register(sock, selectors.EVENT_READ)
+        except (OSError, ValueError):
+            return
+        try:
+            while not self._stop.is_set():
+                if not selector.select(_SELECT_TIMEOUT):
+                    continue
+                # Drain everything readable before going back to the selector:
+                # one wakeup can cover several datagrams, and leaving them
+                # buffered adds a scheduling round trip to each.
+                while True:
+                    try:
+                        data, addr = sock.recvfrom(2048)
+                    except BlockingIOError:
+                        break
+                    except OSError:
+                        return
+                    self._on_datagram(data, addr)
+        finally:
+            selector.close()
+
+    def _on_datagram(self, data: bytes, addr: tuple[str, int]) -> None:
+        if len(data) == STATE_SIZE and data[0] == MSG_STATE:
+            self.state_inbox.append((data, timing.now()))
+            self._relay(data, addr)
+            return
+        msg = protocol.unpack(data)
+        if msg is not None and msg.get(protocol.TYPE) == protocol.MSG_UDP_REGISTER:
+            self._on_udp_register(msg, addr)
+
+    def _relay(self, payload: bytes, sender: tuple[str, int]) -> None:
+        """Forward one client's state to the others.
+
+        Clients know the host's address and nothing else -- they discovered the
+        room, they did not discover each other -- so in a room of three or more
+        the host is the only path between two joiners. Sent verbatim: the
+        payload already names its own player, and re-packing it here would be
+        a second chance to get the quantisation wrong.
+        """
+        sock = self._udp
+        if sock is None:
+            return
+        for endpoint in list(self._udp_endpoints.values()):
+            if endpoint == sender:
+                continue
             try:
-                data, addr = sock.recvfrom(2048)
-            except (socket.timeout, TimeoutError):
-                continue
+                sock.sendto(payload, endpoint)
             except OSError:
-                return
-            msg = protocol.unpack(data)
-            if msg is None:
-                continue
-            kind = msg.get(protocol.TYPE)
-            if kind == protocol.MSG_INPUT:
-                self._on_udp_input(msg, addr)
-            elif kind == protocol.MSG_UDP_REGISTER:
-                self._on_udp_register(msg, addr)
+                pass  # a dropped snapshot is replaced in 50 ms; never block
 
     def _on_udp_register(self, msg: dict[str, Any],
                          addr: tuple[str, int]) -> None:
@@ -281,33 +328,6 @@ class GameHost:
         self._udp_endpoints[pid] = addr
         client.last_rx = timing.now()
 
-    def _on_udp_input(self, msg: dict[str, Any],
-                      addr: tuple[str, int]) -> None:
-        endpoint_owner = None
-        for pid, endpoint in list(self._udp_endpoints.items()):
-            if endpoint == addr:
-                endpoint_owner = pid
-                break
-        if endpoint_owner is None:
-            return  # unregistered sender: ignore rather than trust the packet
-
-        seq_filter = self._input_seq.setdefault(endpoint_owner,
-                                                protocol.SeqFilter())
-        try:
-            seq = int(msg.get("seq", 0))
-        except (TypeError, ValueError):
-            return
-        if not seq_filter.accept(seq):
-            return  # stale or duplicate: the newer input already won
-
-        self._inputs[endpoint_owner] = (bool(msg.get("jump")),
-                                        bool(msg.get("duck")))
-        with self._lock:
-            client = self._clients.get(endpoint_owner)
-        if client is not None:
-            # UDP traffic proves the peer is alive just as well as TCP does.
-            client.last_rx = timing.now()
-
     def _on_message(self, client: ClientConn, msg: dict[str, Any]) -> None:
         """Runs on a socket thread: only touch plain data and the queue."""
         kind = msg.get(protocol.TYPE)
@@ -316,20 +336,14 @@ class GameHost:
             # loop would fold the host's frame time into the measurement.
             self.send_to(client, protocol.pong(msg.get("t", 0.0)))
             return
-        if kind == protocol.MSG_INPUT:
-            # Latest-wins. A tuple assignment into a dict is atomic under the
-            # GIL, so the main thread can read this without a lock.
-            self._inputs[client.id] = (bool(msg.get("jump")),
-                                       bool(msg.get("duck")))
-            return
         if kind == protocol.MSG_JOIN:
             client.name = str(msg.get("name", f"Player {client.id + 1}"))[:16]
             client.skin = int(msg.get("skin", client.id)) % len(C.SKIN_COLORS)
-            # Answer immediately with this client's own id, rather than
-            # waiting for the UI layer to notice the join and push a lobby
-            # update. The id is what the client stamps on its udp_register,
-            # so leaving it to a pump on another thread makes a networking
-            # essential depend on a screen being open.
+            # Answer immediately with this client's own id, rather than waiting
+            # for the UI layer to notice the join and push a lobby update. The
+            # id is what the client stamps on its udp_register, so leaving it
+            # to a pump on another thread makes a networking essential depend
+            # on a screen being open.
             self.send_to(client, protocol.lobby(self.roster(), client.id))
         elif kind == protocol.MSG_READY:
             client.ready = bool(msg.get("ready"))
@@ -341,11 +355,11 @@ class GameHost:
         client.alive = False
         with self._lock:
             self._clients.pop(client.id, None)
+        self._udp_endpoints.pop(client.id, None)
         try:
             client.sock.close()
         except OSError:
             pass
-        self._inputs.pop(client.id, None)
         self.inbox.put((client.id, {protocol.TYPE: "_disconnect"}))
 
     # -- sending ------------------------------------------------------------
@@ -365,40 +379,24 @@ class GameHost:
         except (OSError, ProtocolError):
             self._drop(client)
 
-    def _send_snapshot(self, msg: dict[str, Any]) -> None:
-        """Fan a state snapshot out over UDP, per registered endpoint.
+    def send_state(self, payload: bytes) -> None:
+        """Fan the host's own dino out to every registered client.
 
-        Anyone who has not registered yet -- the first few frames of a run, or
-        a client whose register packet was lost -- falls back to TCP, so a
-        player is never left staring at a frozen world.
+        Fire and forget in the strictest sense: a failed send is discarded
+        without a retry and without a log line. The next one is 50 ms away and
+        supersedes it, and the one thing this call must never do is block the
+        Kivy thread it is running on.
         """
         sock = self._udp
-        with self._lock:
-            clients = list(self._clients.values())
-
-        if sock is None or not C.USE_UDP_GAMEPLAY:
-            for client in clients:
-                self.send_to(client, msg)
+        if sock is None:
+            # No UDP socket at all -- see MSG_STATE_TCP. Badly, but visibly.
+            self.broadcast(protocol.state_tcp(payload))
             return
-
-        try:
-            payload = protocol.pack(msg)
-        except ProtocolError:
-            # Oversized: too big to fragment safely, so send it reliably
-            # instead of dropping the frame.
-            for client in clients:
-                self.send_to(client, msg)
-            return
-
-        for client in clients:
-            endpoint = self._udp_endpoints.get(client.id)
-            if endpoint is None:
-                self.send_to(client, msg)
-                continue
+        for endpoint in list(self._udp_endpoints.values()):
             try:
                 sock.sendto(payload, endpoint)
             except OSError:
-                pass  # a dropped snapshot is replaced next frame; never block
+                pass
 
     # -- roster -------------------------------------------------------------
 
@@ -434,91 +432,31 @@ class GameHost:
         for client in clients:
             self.send_to(client, protocol.lobby(players, client.id))
 
-    # -- game ---------------------------------------------------------------
+    # -- starting a run ------------------------------------------------------
 
-    def start_game(self, seed: int | None = None) -> None:
-        """Build the simulation and tell everyone to start on the same seed."""
+    def start_game(self, seed: int | None = None) -> list[dict[str, Any]]:
+        """Name the world and start the countdown. Returns the roster.
+
+        Two messages, in this order, both reliable:
+
+          SEED   the whole world, as one integer. Every obstacle in the run is
+                 derived from it identically on every device, so this is the
+                 only thing anyone is ever told about the course.
+          START  go, in ``countdown`` seconds. The delay is what makes the
+                 start synchronised rather than staggered: without it the
+                 joiner reaches tick 0 half a round trip late and stays that
+                 far behind in a world where the tick number is the layout.
+
+        The host does not simulate on anyone's behalf here. It builds the same
+        session everyone else does, from the same seed, and plays.
+        """
         self.seed = random.randrange(1 << 31) if seed is None else seed
         entries = self.roster()
-
-        players = [
-            Player(
-                id=e["id"],
-                name=e["name"],
-                skin=e["skin"],
-                x=C.PLAYER_START_X + index * C.PLAYER_SPACING_X,
-            )
-            for index, e in enumerate(entries)
-        ]
-        self.sim = Simulation(self.seed, players)
-        self._inputs.clear()
-        self._accumulator = 0.0
-        self._broadcast_timer = 0.0
-        # Sequence numbers restart with the run, so a rematch must not have
-        # last run's counters filtering out this run's first packets.
-        self._snapshot_seq = 0
-        self._input_seq.clear()
         self.running = True
-        self.broadcast(protocol.start(self.seed, entries))
+        self.state_inbox.clear()
+        self.broadcast(protocol.seed_msg(self.seed, entries))
+        self.broadcast(protocol.start(self.seed, entries, C.START_COUNTDOWN))
+        return entries
 
-    def set_local_input(self, jump: bool, duck: bool) -> None:
-        """The host's own keyboard/touch, applied to player 0."""
-        self._inputs[HOST_PLAYER_ID] = (jump, duck)
-
-    def tick(self, frame_dt: float) -> None:
-        """Advance the authoritative sim and broadcast, on the caller's clock.
-
-        Same fixed-timestep accumulator as single player: real elapsed time is
-        banked and spent in whole TICK_DT slices, so physics never varies with
-        the host's framerate.
-        """
-        if not self.running or self.sim is None:
-            return
-
-        for pid, (jump, duck) in list(self._inputs.items()):
-            self.sim.set_input(pid, jump, duck)
-
-        self._accumulator += min(frame_dt, C.MAX_FRAME_DT)
-        ticks = 0
-        while (self._accumulator >= C.TICK_DT
-               and ticks < C.MAX_TICKS_PER_FRAME):
-            self.sim.step(C.TICK_DT)
-            self._event_buffer.extend(self.sim.state.events)
-            self._accumulator -= C.TICK_DT
-            ticks += 1
-            if not self.sim.state.running:
-                break
-        if ticks == C.MAX_TICKS_PER_FRAME:
-            self._accumulator = 0.0
-
-        # Crashes go out over TCP the moment they happen, ahead of the
-        # snapshot that reports the aftermath. Everything else is cosmetic
-        # enough to ride in the snapshot and be missed occasionally; a crash
-        # with no sound, no shake and no particles just looks like a bug.
-        fatal = [e for e in self._event_buffer if e.get("e") == "crash"]
-        if fatal:
-            self._event_buffer = [e for e in self._event_buffer
-                                  if e.get("e") != "crash"]
-            self.broadcast(protocol.events(fatal))
-
-        state = self.sim.state
-        if not state.running:
-            self.running = False
-            self.broadcast(protocol.gameover(
-                state.score, state.distance,
-                state.cause_player_id, state.cause_obstacle))
-            return
-
-        # State goes out at SNAPSHOT_HZ, not every physics tick -- 60 Hz of
-        # full snapshots is bandwidth we do not need on a LAN.
-        self._broadcast_timer += frame_dt
-        interval = 1.0 / C.SNAPSHOT_HZ
-        if self._broadcast_timer >= interval:
-            self._broadcast_timer = 0.0
-            self._snapshot_seq += 1
-            msg = state_to_snapshot(state)
-            msg[protocol.TYPE] = protocol.MSG_STATE
-            msg["seq"] = self._snapshot_seq
-            msg["events"] = self._event_buffer
-            self._event_buffer = []
-            self._send_snapshot(msg)
+    def end_game(self) -> None:
+        self.running = False

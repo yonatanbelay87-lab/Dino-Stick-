@@ -1,16 +1,28 @@
-"""Wire protocol: message-type constants + framing for both transports.
+"""The reliable channel: message types + framing for rare, critical events.
 
-Two framings, because the two transports have opposite problems:
+The transport is split by how much each message matters, not by convenience.
 
-  TCP  -- a byte stream with no message boundaries. A single recv() can hand
-          back half a header, three whole frames, or one and a half, so every
-          message carries a 4-byte big-endian length header and all reading
-          goes through ``FrameReader``, which buffers until a frame completes.
+  TCP, this module -- things that must arrive exactly once and in order:
+          HELLO/JOIN, SEED, START, DEATH, REVIVE, POWERUP, SCORE_SYNC,
+          GAME_OVER. All low-frequency, all JSON, because a message sent once
+          per run does not need a byte-efficient encoding and does need to be
+          readable in a packet capture at 2am.
 
-  UDP  -- datagrams already preserve boundaries, so the length prefix would be
-          pure overhead: one JSON object per packet, ``pack``/``unpack``.
-          What UDP does not preserve is delivery or order, which is why every
-          gameplay packet carries a ``seq`` (see ``SeqFilter``).
+          TCP is a byte stream with no message boundaries: a single recv() can
+          hand back half a header, three whole frames, or one and a half. So
+          every message carries a 4-byte big-endian length header and all
+          reading goes through ``FrameReader``, which buffers until a frame
+          completes.
+
+  UDP, net/statepacket.py -- the 20 Hz stream of "here is my dino". Fifteen
+          packed bytes, fire and forget, no acknowledgement and no
+          retransmission. A lost one is superseded 50 ms later by definition,
+          so waiting for it would cost more than losing it.
+
+The split is the design. Put a death on the unreliable stream and someone
+occasionally dies with no sound and no particles; put position on the reliable
+one and a single dropped packet head-of-line-blocks every position behind it,
+which is the stutter that made this game leave TCP in the first place.
 
 Nothing here imports Kivy, and nothing here knows about the game: it moves
 dicts.
@@ -25,29 +37,61 @@ from typing import Any, Iterator
 from game import constants as C
 
 # --- Client -> Host, TCP ---------------------------------------------------
-MSG_JOIN: str = "join"  # {name, skin}
+MSG_JOIN: str = "join"  # {name, skin}   -- the HELLO of this protocol
 MSG_READY: str = "ready"  # {ready: bool}
 MSG_SKIN: str = "skin"  # {skin: int}
 
 # --- Client -> Host, UDP ---------------------------------------------------
-MSG_INPUT: str = "input"  # {seq, jump: bool, duck: bool, tick}
-# Sent on game start so the host learns where to aim snapshots. UDP is
+# Sent on game start so the host learns where to aim the state stream. UDP is
 # connectionless: the host knows the client's TCP socket, but that tells it
 # nothing about which port the client's UDP socket is bound to.
+#
+# There is no MSG_INPUT any more. Input never leaves the device it was pressed
+# on -- it moves that device's own dino, immediately, and the *result* is what
+# goes on the wire. Asking a host for permission to jump is exactly the round
+# trip this design exists to delete.
 MSG_UDP_REGISTER: str = "udp_register"  # {id}
 
 # --- Host -> Client(s), TCP ------------------------------------------------
 MSG_LOBBY: str = "lobby"  # {players: [...], you: id}
-MSG_START: str = "start"  # {seed, players: [...]}
+MSG_SEED: str = "seed"  # {seed, players: [...]}
+MSG_START: str = "start"  # {seed, players: [...], countdown}
 MSG_GAMEOVER: str = "gameover"  # {score, distance, cause}
 MSG_REMATCH: str = "rematch"  # {}
-# One-shot events that must not be lost. Only crashes qualify: a missed jump
-# thud is nothing, a missed crash is a death with no sound, no shake and no
-# particles. The rest ride along in the snapshot.
-MSG_EVENT: str = "event"  # {events: [...]}
 
-# --- Host -> Client(s), UDP ------------------------------------------------
-MSG_STATE: str = "state"  # {seq, tick, players, obstacles, ...}
+# --- Shared world events, TCP, either direction ----------------------------
+#
+# Everything here is rare, one-shot and disastrous to lose. They are also the
+# only messages that can change the shared world, which is why they are the
+# only ones the host arbitrates: a power-up alters how fast the world scrolls,
+# so both devices must apply it on the SAME tick or their obstacle streams
+# quietly diverge. The host names that tick.
+#
+# The claim/grant split is the whole mechanism. A device that touches a
+# power-up CLAIMS it (it may have been claimed already, by someone whose packet
+# is still in flight); the host answers with a POWERUP naming an apply_tick a
+# little way ahead, and every device -- including the host -- applies it there.
+MSG_POWERUP_CLAIM: str = "powerup_claim"  # {pid, kind, tick}
+MSG_POWERUP: str = "powerup"  # {pid, kind, apply_tick}
+# A death is detected locally, on the device that owns the dino, and announced.
+# Never inferred from someone else's position: that position is INTERP_DELAY
+# old, and killing a partner with it is a death they never experienced.
+MSG_DEATH: str = "death"  # {id, tick, obstacle}
+MSG_REVIVE: str = "revive"  # {id}
+# Whoever's shield ate the hit says so, so the other devices stop counting on
+# a shield that is gone.
+MSG_SHIELD: str = "shield"  # {id, tick}
+# The host restating the shared score once a second. Both devices derive it
+# independently from the tick, so this only ever corrects drift.
+MSG_SCORE_SYNC: str = "score_sync"  # {tick, score, distance, bonus}
+
+# Degraded path, never the normal one: the 15-byte state packet wrapped in hex
+# and sent over TCP. Only reached when the UDP socket could not be bound at all
+# -- another program on the port, or a locked-down network. It is a bad way to
+# move position (one dropped packet blocks every position behind it, which is
+# the whole reason gameplay left TCP) but it is much better than a partner who
+# never moves, and it costs one branch on a path that is otherwise dead.
+MSG_STATE_TCP: str = "state_tcp"  # {b: hex}
 
 # --- Latency (either direction) --------------------------------------------
 # The client stamps a ping with its own clock and the host echoes it back
@@ -147,29 +191,10 @@ def unpack(payload: bytes) -> dict[str, Any] | None:
     return msg if isinstance(msg, dict) else None
 
 
-class SeqFilter:
-    """Drops stale and duplicate datagrams from one sender.
-
-    UDP reorders and duplicates as well as losing packets. Every gameplay
-    packet supersedes the one before it, so anything not newer than what we
-    already have is simply discarded -- we never wait for a gap to be filled,
-    which is the entire point of leaving TCP behind.
-    """
-
-    __slots__ = ("last_seq",)
-
-    def __init__(self) -> None:
-        self.last_seq = -1
-
-    def accept(self, seq: int) -> bool:
-        if seq <= self.last_seq:
-            return False
-        self.last_seq = seq
-        return True
-
-    def reset(self) -> None:
-        """Between runs: a rematch restarts sequence numbers from zero."""
-        self.last_seq = -1
+# Stale/duplicate rejection for the gameplay stream lives with the packet it
+# filters: see ``statepacket.seq_newer`` and ``peers.PeerBuffer.add``. It moved
+# there when sequence numbers became 16-bit and started wrapping, because the
+# comparison stopped being ``>`` and became something worth testing.
 
 
 # ---------------------------------------------------------------------------
@@ -193,22 +218,66 @@ def skin(index: int) -> dict[str, Any]:
     return {TYPE: MSG_SKIN, "skin": index}
 
 
-def start(seed: int, players: list[dict[str, Any]]) -> dict[str, Any]:
-    return {TYPE: MSG_START, "seed": seed, "players": players}
+def seed_msg(seed: int, players: list[dict[str, Any]]) -> dict[str, Any]:
+    """The shared world, in one integer. Sent before START, never after.
+
+    This is the only thing anyone is ever told about the obstacle course.
+    Everything else -- what spawns, where, how fast, how far apart -- both
+    devices derive from it with an identical ``random.Random(seed)``.
+    """
+    return {TYPE: MSG_SEED, "seed": seed, "players": players}
 
 
-def player_input(jump: bool, duck: bool, seq: int, tick: int = 0
-                 ) -> dict[str, Any]:
-    return {TYPE: MSG_INPUT, "jump": jump, "duck": duck, "seq": seq,
-            "tick": tick}
+def start(seed: int, players: list[dict[str, Any]], countdown: float
+          ) -> dict[str, Any]:
+    """Go. ``countdown`` is seconds from *sending* until world tick 0.
+
+    A synchronised start needs both devices to reach tick 0 together, and a
+    plain "start now" cannot do that -- it arrives half a round trip late, so
+    the joiner is permanently that far behind in a world where the tick number
+    IS the obstacle layout. The countdown gives the message time to land; the
+    joiner subtracts its measured one-way latency from it (game/coop.py), so
+    both clocks reach zero at the same moment rather than the same message.
+    """
+    return {TYPE: MSG_START, "seed": seed, "players": players,
+            "countdown": countdown}
 
 
 def udp_register(player_id: int) -> dict[str, Any]:
     return {TYPE: MSG_UDP_REGISTER, "id": player_id}
 
 
-def events(items: list[dict[str, Any]]) -> dict[str, Any]:
-    return {TYPE: MSG_EVENT, "events": items}
+def powerup_claim(pid: int, kind: str, tick: int) -> dict[str, Any]:
+    return {TYPE: MSG_POWERUP_CLAIM, "pid": pid, "kind": kind, "tick": tick}
+
+
+def powerup(pid: int, kind: str, apply_tick: int) -> dict[str, Any]:
+    return {TYPE: MSG_POWERUP, "pid": pid, "kind": kind,
+            "apply_tick": apply_tick}
+
+
+def death(player_id: int, tick: int, obstacle: str | None) -> dict[str, Any]:
+    return {TYPE: MSG_DEATH, "id": player_id, "tick": tick,
+            "obstacle": obstacle}
+
+
+def revive(player_id: int) -> dict[str, Any]:
+    return {TYPE: MSG_REVIVE, "id": player_id}
+
+
+def shield_break(player_id: int, tick: int) -> dict[str, Any]:
+    return {TYPE: MSG_SHIELD, "id": player_id, "tick": tick}
+
+
+def state_tcp(payload: bytes) -> dict[str, Any]:
+    """Wrap a state packet for the reliable channel. See MSG_STATE_TCP."""
+    return {TYPE: MSG_STATE_TCP, "b": payload.hex()}
+
+
+def score_sync(tick: int, score: int, distance: float, bonus: int
+               ) -> dict[str, Any]:
+    return {TYPE: MSG_SCORE_SYNC, "tick": tick, "score": score,
+            "distance": round(distance, 1), "bonus": bonus}
 
 
 def gameover(score: int, distance: float, player_id: int | None,
