@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kivy.app import App  # noqa: E402
 from kivy.clock import Clock  # noqa: E402
 from kivy.core.window import Window  # noqa: E402
+from kivy.uix.modalview import ModalView  # noqa: E402
 from kivy.uix.screenmanager import NoTransition, ScreenManager  # noqa: E402
 
 from game import constants as C  # noqa: E402
@@ -40,6 +41,7 @@ from screens.gameover import GameOverScreen  # noqa: E402
 from screens.lobby import LobbyScreen  # noqa: E402
 from screens.menu import MenuScreen  # noqa: E402
 from ui import settings  # noqa: E402
+from ui.insets import insets  # noqa: E402
 
 MODE_LOCAL = "local"
 MODE_HOST = "host"
@@ -75,6 +77,11 @@ class DinoStickApp(App):
     def build(self) -> ScreenManager:
         Window.clearcolor = C.COLOR_BG
         _keep_screen_on()
+
+        # Start measuring the notch and the gesture bar before any screen is
+        # built, so the first frame is already laid out inside the safe area
+        # rather than snapping into place once the first poll lands.
+        insets.start()
 
         # Without this the Android soft keyboard covers whatever you are
         # typing into: the window does not move, it just draws the keyboard on
@@ -125,9 +132,18 @@ class DinoStickApp(App):
         if key != KEY_BACK:
             return False
 
+        # A dialog is its own Back level, and Kivy's ModalView already listens
+        # for this key to close itself. Without this guard both handlers fire
+        # from one press: the dialog closes AND the screen behind it navigates,
+        # so a single Back on the join dialog dropped you two levels.
+        if any(isinstance(child, ModalView) for child in Window.children):
+            return False
+
         current = self.sm.current
         if current == GAME:
-            self.sm.get_screen(GAME)._quit()
+            # Asks first -- see GameScreen.request_exit. Back is an edge swipe
+            # in landscape and gets hit by accident.
+            self.sm.get_screen(GAME).request_exit()
         elif current in (LOBBY, GAMEOVER):
             self.leave_network()
             self.sm.current = MENU

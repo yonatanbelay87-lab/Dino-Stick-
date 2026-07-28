@@ -44,6 +44,17 @@ class InputMapper:
 
         self._bound_window: Any = None
 
+        # Height of the strip at the top of the screen reserved for HUD
+        # buttons, in PIXELS. Set by the game screen from the real size of the
+        # Pause button plus the system inset above it. Left as None on a
+        # headless/test mapper, which falls back to the old fraction.
+        #
+        # A fraction is the wrong unit for a touch target: 16% of the screen is
+        # 58dp on a small phone and 128dp on a tablet, so the same constant was
+        # simultaneously too tight to protect a 48dp button and wasteful enough
+        # to eat a fifth of the play area.
+        self.dead_zone_top: float | None = None
+
         # Touch state for local player 0: finger id -> action.
         self._touches: dict[Any, str] = {}
         # Keys currently held for player 0, kept separately so touch and
@@ -104,9 +115,11 @@ class InputMapper:
         """Which action a point falls in, or None for dead zones."""
         if width <= 0 or height <= 0:
             return None
-        fx, fy = x / width, y / height
-        if fy > 1.0 - C.TOUCH_DEAD_ZONE_TOP:
+        dead = (height * C.TOUCH_DEAD_ZONE_TOP if self.dead_zone_top is None
+                else min(self.dead_zone_top, height * 0.5))
+        if y > height - dead:
             return None  # reserved for HUD buttons
+        fx, fy = x / width, y / height
         for action, (zx, zy, zw, zh) in C.TOUCH_ZONES.items():
             if zx <= fx < zx + zw and zy <= fy < zy + zh:
                 return action

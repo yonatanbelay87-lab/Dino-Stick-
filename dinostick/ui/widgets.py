@@ -25,6 +25,7 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.widget import Widget
 
 from . import theme
+from .insets import insets
 
 
 class _RoundedBackground:
@@ -90,11 +91,17 @@ class TouchButton(Button, _RoundedBackground):
         self._c_outline = style["outline"]
         self._c_text = style["text"]
 
+        # A two-line button needs two lines' worth of room. At the 48dp small
+        # height a title plus a subtitle already filled it, and a player with
+        # Android's font size turned up lost the second line entirely -- so a
+        # subtitle raises the floor rather than being squeezed in.
+        floor = theme.BUTTON_HEIGHT if subtitle else theme.TOUCH_MIN
+
         super().__init__(
             text=self.compose(text, subtitle),
             markup=bool(subtitle),
             size_hint_y=None,
-            height=max(height or theme.BUTTON_HEIGHT, theme.TOUCH_MIN),
+            height=max(height or theme.BUTTON_HEIGHT, floor),
             font_size=theme.FONT_BODY,
             halign="center",
             valign="middle",
@@ -122,12 +129,14 @@ class TouchButton(Button, _RoundedBackground):
         """
         if not subtitle:
             return text
-        return f"{text}\n[size={int(theme.FONT_TINY)}]{subtitle}[/size]"
+        # FONT_SMALL, not the old FONT_TINY: a subtitle is a sentence ("Friends
+        # join from your Wi-Fi") and 12sp is under Android's legibility floor.
+        return f"{text}\n[size={int(theme.FONT_SMALL)}]{subtitle}[/size]"
 
     def _sync_text_size(self, *_) -> None:
         # Without an explicit text_size, halign does nothing and long labels
         # run off the edge instead of wrapping.
-        self.text_size = (self.width - 2 * theme.PAD, None)
+        self.text_size = (max(0.0, self.width - 2 * theme.SPACE_3), None)
 
     def _sync_style(self, *_) -> None:
         if self.disabled:
@@ -234,17 +243,20 @@ class Badge(Label, _RoundedBackground):
             font_size=theme.FONT_CAPTION,
             color=theme.ON_FILL if filled else color,
             size_hint=(None, None),
-            height=dp(20),
+            # Derived from the type, not a fixed 20dp: sp() grows with the
+            # user's system font-size setting, and a hard height clipped the
+            # descenders off "READY" on anything above 100%.
+            height=max(dp(22), theme.FONT_CAPTION * 1.9),
             **kw,
         )
         self._init_background((*color[:3], 1.0) if filled else (0, 0, 0, 0),
                               (0, 0, 0, 0) if filled else (*color[:3], 0.45),
-                              radius=dp(10))
+                              radius=self.height * 0.5)
         self.bind(texture_size=self._sync_width)
         self._sync_width()
 
     def _sync_width(self, *_) -> None:
-        self.width = self.texture_size[0] + 2 * theme.PAD_SM + dp(6)
+        self.width = self.texture_size[0] + 2 * theme.SPACE_2
 
 
 class Dot(Widget):
@@ -361,6 +373,12 @@ class Panel(FloatLayout):
     what this game runs in -- a full-bleed button would stretch to well over
     2000px, which looks broken and puts the label miles from your thumb.
 
+    The column lives inside the SAFE area, not the window: the background is
+    painted edge to edge (a black bar beside a notch looks broken) but nothing
+    you have to read or hit goes under the camera or the gesture bar. Centring
+    is against the safe box too, so a cutout down the left of a landscape phone
+    shifts the column right rather than leaving it visually off-centre.
+
     ``add_widget`` forwards into that column, so screens using this class need
     no changes.
     """
@@ -373,17 +391,17 @@ class Panel(FloatLayout):
             self._bg = Rectangle(pos=self.pos, size=self.size)
         self.bind(pos=self._sync_bg, size=self._sync_bg)
 
-        # The column scrolls. A phone in landscape is only ~800px tall, and a
-        # title plus five 60dp buttons does not fit -- without this the top of
+        # The column scrolls. A phone in landscape is only ~360dp tall, and a
+        # title plus five 56dp buttons does not fit -- without this the top of
         # the screen is simply cut off, which is exactly how it looked first
-        # time round.
-        self.scroll = ScrollView(size_hint=(None, 1),
-                                 pos_hint={"center_x": 0.5, "y": 0},
+        # time round. Positioned by hand rather than by pos_hint because the
+        # frame it is centred in is the safe box, not the window.
+        self.scroll = ScrollView(size_hint=(None, None),
                                  bar_width=dp(3), do_scroll_x=False)
         self.column = BoxLayout(
             orientation="vertical",
-            spacing=theme.GAP,
-            padding=(0, theme.PAD, 0, theme.PAD),
+            spacing=theme.STACK_GAP,
+            padding=(0, theme.SPACE_3, 0, theme.SPACE_3),
             size_hint_y=None,
         )
         self.column.bind(minimum_height=self._sync_height)
@@ -394,7 +412,8 @@ class Panel(FloatLayout):
         # height is what the centring maths needs, and it lags the Panel's by
         # a layout pass.
         self.scroll.bind(height=self._sync_height)
-        self.bind(width=self._sync_column)
+        self.bind(pos=self._sync_column, size=self._sync_column)
+        insets.bind_layout(self._sync_column)
         self._sync_column()
 
     def _sync_bg(self, *_) -> None:
@@ -413,16 +432,24 @@ class Panel(FloatLayout):
         content = sum(child.height for child in self.column.children)
         content += self.column.spacing * max(0, len(self.column.children) - 1)
         slack = self.scroll.height - content
-        pad = theme.PAD if slack < 2 * theme.PAD else slack * 0.5
+        floor = theme.SPACE_3
+        pad = floor if slack < 2 * floor else slack * 0.5
         self.column.padding = (0, pad, 0, pad)
         self.column.height = content + 2 * pad
 
     def _sync_column(self, *_) -> None:
         if self.column is None:
             return
-        width = min(max(self.width - 2 * theme.PAD, theme.PAD),
-                    theme.CONTENT_MAX_WIDTH)
+        sx, sy, sw, sh = insets.box(self.width, self.height)
+        # EDGE on top of the system inset: the inset clears the notch, this
+        # clears the rounded corner and stops the column touching the glass.
+        avail = max(theme.SPACE_4, sw - 2 * theme.EDGE)
+        width = min(avail, theme.CONTENT_MAX_WIDTH)
+
         self.scroll.width = width
+        self.scroll.height = max(0.0, sh)
+        self.scroll.x = self.x + sx + (sw - width) * 0.5
+        self.scroll.y = self.y + sy
         self.column.width = width
 
     def add_widget(self, widget, *args, **kwargs):
@@ -461,8 +488,10 @@ class Dialog(ModalView):
             **kw,
         )
 
-        anchor = AnchorLayout(anchor_x="center", anchor_y="center",
-                              padding=theme.PAD)
+        # Padded by the system insets so a dialog is centred in the part of
+        # the screen you can actually see, and its Close button never lands
+        # under the gesture bar.
+        self._anchor = AnchorLayout(anchor_x="center", anchor_y="center")
         # auto_height off: a dialog is sized to the screen, not to its text.
         card = Card(spacing=theme.GAP, auto_height=False)
 
@@ -480,24 +509,76 @@ class Dialog(ModalView):
         card.add_widget(TouchButton(dismiss_text, self.dismiss,
                                     variant="secondary"))
 
-        anchor.add_widget(card)
-        super().add_widget(anchor)
+        self._anchor.add_widget(card)
+        super().add_widget(self._anchor)
 
         self._card = card
         self.bind(size=self._sync_card)
+        insets.bind_layout(self._sync_card)
         self._sync_card()
 
     def _sync_card(self, *_) -> None:
         # Cap the card so a dialog does not stretch to 2000px on a landscape
         # phone, and leave the screen edges visible so "tap outside to close"
         # is discoverable.
-        self._card.width = min(self.width - 2 * theme.PAD,
-                               theme.CONTENT_MAX_WIDTH + dp(80))
+        self._anchor.padding = [insets.left + theme.EDGE,
+                                insets.top + theme.EDGE,
+                                insets.right + theme.EDGE,
+                                insets.bottom + theme.EDGE]
+        _, _, safe_w, safe_h = insets.box(self.width, self.height)
+        avail_w = max(theme.SPACE_4, safe_w - 2 * theme.EDGE)
+        avail_h = max(theme.SPACE_4, safe_h - 2 * theme.EDGE)
+
+        self._card.width = min(avail_w, theme.CONTENT_MAX_WIDTH + dp(80))
         self._card.size_hint_x = None
-        self._card.height = min(self.height - 2 * theme.PAD, dp(460))
+        # No dp(460) ceiling any more: that was tuned for one screen shape, and
+        # on a short landscape phone it fought the inset padding for the same
+        # pixels. The safe box is the only real limit.
+        self._card.height = min(avail_h, dp(460))
         self._card.size_hint_y = None
 
     def add_widget(self, widget, *args, **kwargs):
         if self.body is None:
             return super().add_widget(widget, *args, **kwargs)
         return self.body.add_widget(widget, *args, **kwargs)
+
+
+class ConfirmDialog(Dialog):
+    """Ask before doing something the player cannot undo.
+
+    Exists because Back mid-run used to end the run outright. On Android that
+    button is a system gesture -- a swipe from the edge of the screen, which is
+    also where your thumb rests holding the phone in landscape -- so it gets
+    hit by accident, and a good run vanished with no way back.
+
+    The dismiss button is the SAFE option and the one in the body is the
+    destructive one, so tapping outside, hitting Back again, or panicking all
+    resolve to "carry on".
+    """
+
+    def __init__(self, title: str, message: str, confirm_text: str,
+                 on_confirm: Callable[[], None],
+                 cancel_text: str = "Keep playing",
+                 on_cancel: Callable[[], None] | None = None, **kw) -> None:
+        super().__init__(title=title, dismiss_text=cancel_text, **kw)
+        self._on_cancel = on_cancel
+        self._confirmed = False
+
+        text = Label(text=message, font_size=theme.FONT_SMALL,
+                     color=theme.GROUND, halign="center", valign="middle")
+        text.bind(size=lambda w, *_: setattr(w, "text_size",
+                                             (w.width, w.height)))
+        self.add_widget(text)
+
+        def confirm() -> None:
+            self._confirmed = True
+            self.dismiss()
+            on_confirm()
+
+        self.add_widget(TouchButton(confirm_text, confirm, variant="danger"))
+
+    def on_dismiss(self) -> None:
+        # Fires for every route out, including tapping the scrim -- so resuming
+        # a paused game belongs here rather than on the Cancel button alone.
+        if not self._confirmed and self._on_cancel is not None:
+            self._on_cancel()

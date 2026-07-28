@@ -85,22 +85,51 @@ BUTTON_VARIANTS: dict[str, dict] = {
 # Sized against the real constraint: a phone in landscape gives roughly 390dp
 # of HEIGHT (1080px at ~2.75 density). A title plus four buttons has to live
 # inside that, so the vertical budget is tight even though the screen is wide.
+#
+# The floor is 14sp for anything that reads as a sentence. It used to be 11-12,
+# which is where the HUD's "620 m - 32 km/h" and every button subtitle lived --
+# small enough that a phone at arm's length in motion could not resolve them,
+# and small enough to fail Android's own accessibility guidance.
+#
+# sp() also scales with the user's system font-size setting, so a player on
+# "large text" gets 1.3x of all of these. Nothing may be sized to fit exactly.
 FONT_DISPLAY = sp(44)  # the one number you actually want to see
 FONT_TITLE = sp(34)
 FONT_HEADING = sp(24)
 FONT_BODY = sp(18)
-FONT_SMALL = sp(14)
-FONT_TINY = sp(12)
-FONT_CAPTION = sp(11)  # the little grey word above a value
+FONT_SMALL = sp(14)  # the body floor: subtitles, hints, status lines
+FONT_TINY = sp(13)  # nameplates over a dino's head; never a sentence
+FONT_CAPTION = sp(12)  # the little uppercase word above a value
 
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
+#
+# One spacing scale, 4dp-based, and everything aligns to it. The previous set
+# was 4/6/8/10/12 -- five values, three of them a couple of pixels apart, which
+# is how the same "gap" ended up looking different on every screen.
 
-PAD = dp(10)
-PAD_SM = dp(6)
-GAP = dp(8)
-GAP_SM = dp(4)
+SPACE_1 = dp(4)
+SPACE_2 = dp(8)
+SPACE_3 = dp(12)
+SPACE_4 = dp(16)
+SPACE_5 = dp(24)
+SPACE_6 = dp(32)
+
+PAD = SPACE_3
+PAD_SM = SPACE_2
+GAP = SPACE_2
+GAP_SM = SPACE_1
+
+# Vertical gap between stacked full-width buttons. Deliberately larger than
+# GAP: 8dp between two 48dp targets is inside a thumb's own margin of error,
+# and the miss you get is "Leave" when you meant "I'm Ready".
+STACK_GAP = SPACE_3
+
+# Distance any control keeps from a screen edge, on TOP of the system inset.
+# The inset stops a control being under the notch; this stops it being welded
+# to the glass, and covers the rounded corners no inset ever reports.
+EDGE = SPACE_3
 
 RADIUS = dp(14)
 RADIUS_SM = dp(9)
@@ -117,5 +146,5 @@ BUTTON_HEIGHT_SMALL = dp(48)
 # landscape a single button becomes an absurd 2000px-wide bar.
 CONTENT_MAX_WIDTH = dp(520)
 
-ROW_HEIGHT = dp(40)
-CARD_PAD = dp(12)
+ROW_HEIGHT = dp(48)  # a roster line, at the touch-target floor
+CARD_PAD = SPACE_3

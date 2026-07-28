@@ -35,7 +35,8 @@ from game.prediction import LocalPredictor
 from game.simulation import Simulation, make_players, modifiers_for
 from ui import audio, theme
 from ui import format as fmt
-from ui.widgets import Badge, Card, Meter, Stat, TouchButton
+from ui.insets import insets
+from ui.widgets import Badge, Card, ConfirmDialog, Meter, Stat, TouchButton
 
 from . import GAMEOVER, MENU
 
@@ -79,6 +80,7 @@ class GameView(Widget):
         return super().on_touch_up(touch)
 
 
+
 class GameScreen(Screen):
     def __init__(self, **kw) -> None:
         super().__init__(**kw)
@@ -88,12 +90,16 @@ class GameScreen(Screen):
         self._accumulator = 0.0
         self._mode = "local"
         self._last_event_tick = -1
+        self._dead_zone_top = theme.TOUCH_MIN * 2.0
+        self._exit_dialog = None
         # Client mode only: runs this device's own dino ahead of the network.
         self._predictor = LocalPredictor()
         audio.preload()
 
         root = FloatLayout()
 
+        # The world is drawn edge to edge -- the painted seasons should reach
+        # into the notch, they are scenery. Only the HUD below is inset.
         self.view = GameView()
         root.add_widget(self.view)
         self.renderer = Renderer(self.view)
@@ -105,17 +111,20 @@ class GameScreen(Screen):
         # Distance and speed are in metres and km/h. They used to read
         # "62,043 px   890 px/s", which is a debug line: nobody knows whether
         # 62,043 px is a good run.
+        #
+        # auto_height, not a hard dp(84): the card's contents are sized in sp,
+        # so a player with Android's font size turned up had the distance line
+        # clipped off the bottom of a card that could not grow.
         self.score_card = Card(
-            size_hint=(None, None), size=(dp(168), dp(84)),
-            pos_hint={"right": 0.985, "top": 0.975},
+            size_hint=(None, None),
             fill=(1.0, 1.0, 1.0, 0.88), outline=(0, 0, 0, 0.08),
-            auto_height=False, padding=(theme.PAD, theme.PAD_SM),
+            auto_height=True, padding=(theme.SPACE_3, theme.SPACE_2),
             spacing=0)
         self.score_stat = Stat("Score", "0", value_size=theme.FONT_HEADING)
         self.score_card.add_widget(self.score_stat)
         self.progress_label = Label(
-            text="", font_size=theme.FONT_TINY, color=theme.GROUND,
-            size_hint_y=None, height=theme.FONT_TINY * 1.6)
+            text="", font_size=theme.FONT_SMALL, color=theme.GROUND,
+            size_hint_y=None, height=theme.FONT_SMALL * 1.6)
         self.score_card.add_widget(self.progress_label)
         root.add_widget(self.score_card)
 
@@ -124,38 +133,38 @@ class GameScreen(Screen):
         # the value, so it is readable without looking straight at it.
         self.tension_label = Label(
             text="ROPE", font_size=theme.FONT_CAPTION, color=theme.FAINT,
-            size_hint=(None, None), size=(dp(80), dp(16)),
-            pos_hint={"center_x": 0.5, "top": 0.99},
-        )
+            size_hint=(None, None),
+            size=(dp(80), theme.FONT_CAPTION * 1.6))
         root.add_widget(self.tension_label)
         self.tension_meter = Meter(size_hint=(None, None),
-                                   size=(dp(160), dp(10)),
-                                   pos_hint={"center_x": 0.5, "top": 0.955})
+                                   size=(dp(160), dp(10)))
         root.add_widget(self.tension_meter)
 
         # Active team power-ups, as badges in the team's colours instead of a
         # run-on string. They sit under the rope meter: dead centre of the
         # sky, where nothing else is ever drawn.
+        #
+        # Width is assigned in _layout_hud from the safe box. It was a fixed
+        # dp(360), which is wider than the whole safe area on a small phone.
         self.effects_row = BoxLayout(
-            orientation="horizontal", spacing=theme.GAP_SM,
-            size_hint=(None, None), size=(dp(360), dp(22)),
-            pos_hint={"center_x": 0.5, "top": 0.90})
+            orientation="horizontal", spacing=theme.SPACE_1,
+            size_hint=(None, None), size=(dp(360), dp(26)))
         root.add_widget(self.effects_row)
         self._effect_badges: dict[str, Badge] = {}
         self._effect_kinds: list[str] = []
 
         # Connection quality (client) / role (host).
         self.net_label = Label(
-            text="", font_size=theme.FONT_TINY, color=theme.GROUND,
+            text="", font_size=theme.FONT_SMALL, color=theme.GROUND,
             halign="left", valign="middle",
-            size_hint=(None, None), size=(dp(220), dp(22)),
-            pos_hint={"x": 0.03, "top": 0.83},
-        )
+            size_hint=(None, None), size=(dp(240), dp(24)))
         self.net_label.bind(size=lambda w, *_: setattr(
             w, "text_size", (w.width, w.height)))
         root.add_widget(self.net_label)
 
-        # One nameplate per dino, repositioned every frame.
+        # One nameplate per dino, repositioned every frame by the renderer, so
+        # these are the one HUD element the safe box does not govern -- they
+        # follow the world, and the world is full-bleed.
         self.nameplates: list[Label] = []
         for _ in range(C.MAX_PLAYERS):
             plate = Label(text="", font_size=theme.FONT_TINY,
@@ -166,42 +175,121 @@ class GameScreen(Screen):
 
         self.hint_label = Label(
             text="", font_size=theme.FONT_SMALL, color=theme.FAINT,
-            size_hint=(None, None), size=(dp(620), dp(24)),
-            pos_hint={"center_x": 0.5, "y": 0.04},
-        )
+            halign="center", valign="middle",
+            size_hint=(None, None), size=(dp(620), dp(24)))
+        self.hint_label.bind(size=lambda w, *_: setattr(
+            w, "text_size", (w.width, w.height)))
         root.add_widget(self.hint_label)
 
         # Big touch-zone labels, shown for the first few seconds of a run so a
         # new player on a phone knows which half does what, then faded away.
         self.zone_hints: list[Label] = []
-        for cx, text, sub in ((0.25, "DUCK", "hold this half"),
-                              (0.75, "JUMP", "tap this half")):
+        for text, sub in (("DUCK", "hold this half"), ("JUMP", "tap this half")):
             hint = Label(text=f"{text}\n[size={int(theme.FONT_SMALL)}]{sub}"
                               f"[/size]",
-                         markup=True, halign="center",
+                         markup=True, halign="center", valign="middle",
                          font_size=theme.FONT_TITLE,
                          color=theme.FAINT, opacity=0.0,
-                         size_hint=(None, None), size=(dp(240), dp(80)),
-                         pos_hint={"center_x": cx, "y": 0.13})
+                         size_hint=(None, None), size=(dp(240), dp(88)))
             self.zone_hints.append(hint)
             root.add_widget(hint)
 
-        # Thumb-sized quit target. It sits inside the input dead zone at the
+        # Thumb-sized pause target. It sits inside the input dead zone at the
         # top of the screen, so pressing it can never also trigger a jump.
         # Plain text on purpose: block/pause glyphs are not in Kivy's default
         # font and render as tofu boxes on both desktop and Android.
         self.quit_button = TouchButton(
-            "Quit", self._quit,
+            "Pause", self.request_exit,
             variant="overlay",
             height=theme.TOUCH_MIN,
             size_hint=(None, None),
-            pos_hint={"x": 0.015, "top": 0.975},
         )
-        self.quit_button.width = dp(96)
+        self.quit_button.width = dp(104)
         self.quit_button.font_size = theme.FONT_SMALL
         root.add_widget(self.quit_button)
 
+        self.root_layout = root
         self.add_widget(root)
+
+        root.bind(pos=self._layout_hud, size=self._layout_hud)
+        # The score card sizes itself to its text, so it has to be re-anchored
+        # to the top-right corner every time that height changes -- otherwise
+        # it grows downward from a stale y and drifts off the corner.
+        self.score_card.bind(height=self._layout_hud)
+        insets.bind_layout(self._layout_hud)
+        self._layout_hud()
+
+    # -- HUD layout ---------------------------------------------------------
+
+    def _layout_hud(self, *_args) -> None:
+        """Place every HUD element against the SAFE box, in dp from its edge.
+
+        Everything here used to be a pos_hint fraction of the window, which is
+        two bugs in one. A fraction is not a distance -- ``x: 0.015`` is 13dp
+        on a phone and 30dp on a tablet -- and a fraction of the *window* knows
+        nothing about the camera cutout, so in landscape the Pause button sat
+        under the notch and the control hint ran under the gesture bar.
+        """
+        root = self.root_layout
+        sx, sy, sw, sh = insets.box(root.width, root.height)
+        if sw <= 0 or sh <= 0:
+            return
+        sx, sy = root.x + sx, root.y + sy
+        edge = theme.EDGE
+        top = sy + sh - edge
+        centre_x = sx + sw * 0.5
+
+        # Top-left: pause. Top-right: score.
+        self.quit_button.x = sx + edge
+        self.quit_button.top = top
+
+        self.score_card.width = min(dp(180), max(dp(132), sw * 0.34))
+        self.score_card.right = sx + sw - edge
+        self.score_card.top = top
+
+        # Top-centre: the rope meter, between the two of them.
+        self.tension_label.center_x = centre_x
+        self.tension_label.top = top
+        self.tension_meter.width = min(dp(160), sw * 0.30)
+        self.tension_meter.center_x = centre_x
+        self.tension_meter.top = self.tension_label.y - theme.SPACE_1
+
+        # Power-up badges hang under the meter, clear of the score card.
+        self.effects_row.width = max(dp(120), sw - 2 * (edge + dp(112)))
+        self.effects_row.center_x = centre_x
+        self.effects_row.top = self.tension_meter.y - theme.SPACE_3
+
+        self.net_label.x = sx + edge
+        self.net_label.top = self.quit_button.y - theme.SPACE_2
+
+        # Bottom: the control reminder, above the gesture bar rather than
+        # under it.
+        self.hint_label.width = max(dp(200), sw - 2 * edge)
+        self.hint_label.center_x = centre_x
+        self.hint_label.y = sy + edge
+
+        # The zone hints label the touch halves, so they follow the halves of
+        # the SAFE box -- otherwise they drift off-centre from the zones they
+        # are describing on a phone with a cutout down one side.
+        for index, hint in enumerate(self.zone_hints):
+            hint.width = min(dp(240), sw * 0.4)
+            hint.center_x = sx + sw * (0.25 if index == 0 else 0.75)
+            hint.y = sy + sh * 0.28
+
+        self._sync_dead_zone()
+
+    def _sync_dead_zone(self) -> None:
+        """Reserve the top strip so tapping Pause cannot also jump.
+
+        Measured in dp down from the top of the screen, not as a fraction of
+        it. The old 16% was 58dp on a small phone (barely clearing a 48dp
+        button) and 128dp on a tablet (a fifth of the play area thrown away for
+        a control that had not grown at all).
+        """
+        self._dead_zone_top = (insets.top + theme.EDGE + theme.TOUCH_MIN
+                               + theme.SPACE_2)
+        if self.mapper is not None:
+            self.mapper.dead_zone_top = self._dead_zone_top
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -209,6 +297,12 @@ class GameScreen(Screen):
         self.start_run()
 
     def on_leave(self, *_args) -> None:
+        # A networked run can end while the "leave?" question is still up --
+        # the sim never stopped. Take the modal with us, or it hangs over the
+        # game-over card with nothing behind it.
+        if self._exit_dialog is not None:
+            dialog, self._exit_dialog = self._exit_dialog, None
+            dialog.dismiss()
         self._teardown()
 
     def start_run(self, seed: int | None = None) -> None:
@@ -251,6 +345,7 @@ class GameScreen(Screen):
         self._fade_hint()
 
         self.mapper.bind_keyboard(Window)
+        self.mapper.dead_zone_top = self._dead_zone_top
         self.view.mapper = self.mapper  # touch zones -> local player 0
         self._accumulator = 0.0
         self._last_event_tick = -1
@@ -604,7 +699,62 @@ class GameScreen(Screen):
         )
         self.manager.current = GAMEOVER
 
+    # -- leaving a run ------------------------------------------------------
+
+    def request_exit(self) -> None:
+        """Pause / confirm before ending a run. Back and the Pause button.
+
+        Back on Android is an edge swipe, and in landscape the edge of the
+        screen is where your thumb rests holding the phone. It used to end the
+        run outright: one accidental brush and a good run was gone with no
+        undo. Now it asks.
+
+        Solo runs are genuinely PAUSED while it asks -- the clock stops.
+        Networked runs are not: stopping the host's clock would freeze the
+        world for every other player to spare one person a decision, so those
+        get the same question with the run still going. That is the honest
+        trade, and it is why the wording differs.
+        """
+        if self._exit_dialog is not None:
+            return  # already asking
+
+        solo = self._mode == "local"
+        if solo:
+            self._pause()
+
+        dialog = ConfirmDialog(
+            title="Paused" if solo else "Leave the run?",
+            message=("Your run is on hold. Nothing is lost." if solo else
+                     "The others keep running without you, and the run "
+                     "carries on while you decide."),
+            confirm_text="End run",
+            cancel_text="Resume" if solo else "Keep playing",
+            on_confirm=self._quit,
+            on_cancel=self._resume if solo else self._clear_exit_dialog,
+        )
+        self._exit_dialog = dialog
+        dialog.open()
+
+    def _pause(self) -> None:
+        if self._event is not None:
+            self._event.cancel()
+            self._event = None
+
+    def _resume(self) -> None:
+        self._clear_exit_dialog()
+        # A finger held on the screen when the dialog opened never sent its
+        # touch_up, so without this the dino resumes mid-duck forever.
+        if self.mapper is not None:
+            self.mapper.reset()
+        if self._event is None and self.mapper is not None:
+            self._accumulator = 0.0  # do not fast-forward the paused seconds
+            self._event = Clock.schedule_interval(self._frame, 0)
+
+    def _clear_exit_dialog(self) -> None:
+        self._exit_dialog = None
+
     def _quit(self) -> None:
+        self._clear_exit_dialog()
         self._teardown()
         app = App.get_running_app()
         if app is not None:

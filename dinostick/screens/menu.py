@@ -46,7 +46,7 @@ class JoinDialog(Dialog):
         # Status above the list, not below it: while the list is empty -- which
         # is most of the time you are looking at this -- a line underneath a
         # blank area reads as a footnote to nothing.
-        self._status = Caption("Searching...", theme.FONT_TINY,
+        self._status = Caption("Searching...", theme.FONT_SMALL,
                                color=theme.FAINT)
         self.add_widget(self._status)
 
