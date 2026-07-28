@@ -15,7 +15,7 @@ source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,wav,ogg,ttf,md
 source.include_patterns = assets/*,assets/*/*
 
-version = 0.1.0
+version = 1.1.0
 
 # pyjnius is needed for the WifiManager.MulticastLock that makes UDP
 # discovery work on Android at all (see net/discovery.py).

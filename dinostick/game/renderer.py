@@ -10,6 +10,7 @@ screen shapes agree on where everything is in world terms AND draw the same
 undistorted characters -- a phone panel is nowhere near 16:9, and scaling the
 axes independently to fill it squashed every dino.
 
+
 The renderer owns a little transient visual state of its own -- screen shake
 and crash particles -- because those are pure presentation and should never
 travel over the network or affect the simulation.
