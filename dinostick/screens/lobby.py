@@ -21,7 +21,7 @@ from net import protocol
 from ui import settings, theme
 from ui.widgets import (Badge, Caption, Card, DashedCard, DinoAvatar,
                         DinoPicker, IconButton, LiveDot, MenuButton, Panel,
-                        Title)
+                        Title, animate)
 
 from . import GAME, MENU
 
@@ -30,6 +30,9 @@ class LobbyScreen(Screen):
     def __init__(self, **kw) -> None:
         super().__init__(**kw)
         self._ready = False
+        # Player ids rendered last time, so refresh() can tell an arrival
+        # from a re-render.
+        self._seen_ids: set = set()
 
         # Top-aligned, not centred. The two halves hold very different amounts
         # -- four roster rows on the left against three controls on the right
@@ -64,11 +67,17 @@ class LobbyScreen(Screen):
         # by whoever is typing it in at the other end.
         self.address_card = Card(fill=theme.SURFACE_ALT, outline=theme.BORDER,
                                  auto_height=False, size_hint_y=None, height=0,
-                                 opacity=0.0, orientation="horizontal")
+                                 opacity=0.0, orientation="horizontal",
+                                 padding=(theme.SPACE_3, theme.SPACE_2),
+                                 spacing=theme.SPACE_2)
         address_text = BoxLayout(orientation="vertical", spacing=0)
         self.address_caption = Caption("OTHERS JOIN AT", theme.FONT_CAPTION,
                                        color=theme.FAINT, halign="left")
-        self.address_value = Caption("", theme.FONT_HEADING, color=theme.FG,
+        # FONT_BODY, not FONT_HEADING. At 24sp the address ran most of the
+        # way across the column on a 640dp phone and dwarfed the heading
+        # above it. 18sp mono is still readable out loud across a room,
+        # which is the only job this line has.
+        self.address_value = Caption("", theme.FONT_BODY, color=theme.FG,
                                      mono=True, halign="left")
         address_text.add_widget(self.address_caption)
         address_text.add_widget(self.address_value)
@@ -81,8 +90,8 @@ class LobbyScreen(Screen):
 
         # Grows with the roster but never past four rows, after which it
         # scrolls. A fixed height would leave a dead gap with two players.
-        self.player_scroll = ScrollView(bar_width=dp(4), size_hint_y=None,
-                                        height=theme.ROW_HEIGHT,
+        self.player_scroll = ScrollView(bar_width=theme.SCROLLBAR_WIDTH, size_hint_y=None,
+                                        height=theme.ROW_HEIGHT_COMPACT,
                                         do_scroll_x=False)
         # 8dp between rows, not 4. At 4 the outlines of adjacent cards nearly
         # touched and the list read as one striped block; 8 lets each player be
@@ -98,14 +107,17 @@ class LobbyScreen(Screen):
         self.dino_picker = DinoPicker(self._set_skin)
         root.col_right.add_widget(self.dino_picker)
 
-        self.ready_button = MenuButton("I'M READY", self._toggle_ready)
+        self.ready_button = MenuButton("I'M READY", self._toggle_ready,
+                                       height=theme.BUTTON_HEIGHT_COMPACT)
         root.col_right.add_widget(self.ready_button)
 
-        self.start_button = MenuButton("START GAME", self._start)
+        self.start_button = MenuButton("START GAME", self._start,
+                                       height=theme.BUTTON_HEIGHT_COMPACT)
         root.col_right.add_widget(self.start_button)
 
-        root.col_right.add_widget(MenuButton("Leave", self._back, variant="quiet",
-                                         height=theme.BUTTON_HEIGHT_SMALL))
+        root.col_right.add_widget(MenuButton(
+            "Leave", self._back, variant="quiet",
+            height=theme.BUTTON_HEIGHT_SMALL))
 
         # Kept as an alias: refresh() retitles it, and the old name is part of
         # the screen's surface. The picker owns the label now.
@@ -117,6 +129,8 @@ class LobbyScreen(Screen):
     def on_pre_enter(self, *_args) -> None:
         app = App.get_running_app()
         self._ready = False
+        # Arriving fresh: everyone already here is not an "arrival".
+        self._seen_ids = {e.get("id") for e in self._entries(app)}
         host_mode = app.mode == "host"
 
         if host_mode:
@@ -130,7 +144,12 @@ class LobbyScreen(Screen):
                                   "Two dinos, one keyboard")
 
         self._show_address(host_mode)
+        self.live_dot.start_pulse()
         self.refresh()
+
+    def on_leave(self, *_args) -> None:
+        # A looping Animation on a screen nobody can see is pure waste.
+        self.live_dot.stop_pulse()
 
     def _show_address(self, visible: bool) -> None:
         self.address_card.opacity = 1.0 if visible else 0.0
@@ -145,7 +164,8 @@ class LobbyScreen(Screen):
     def _sync_list_height(self, _widget, minimum_height: float) -> None:
         self.player_list.height = minimum_height
         self.player_scroll.height = min(
-            minimum_height, (theme.ROW_HEIGHT + theme.SPACE_2) * 4.2)
+            minimum_height,
+            (theme.ROW_HEIGHT_COMPACT + theme.SPACE_2) * 4.2)
 
     @staticmethod
     def _set_visible(widget, visible: bool, height: float) -> None:
@@ -166,10 +186,22 @@ class LobbyScreen(Screen):
         if app is None:
             return
 
-        self.player_list.clear_widgets()
+        # refresh() rebuilds the whole list on every lobby message, so a
+        # blanket entrance animation would re-play for everyone whenever
+        # anybody toggled Ready. Diff by id instead: only a genuinely new
+        # arrival fades in, which is the moment worth drawing attention to.
         entries = self._entries(app)
+        seen = {entry.get("id") for entry in entries}
+        arrivals = seen - self._seen_ids
+        self._seen_ids = seen
+
+        self.player_list.clear_widgets()
         for entry in entries:
-            self.player_list.add_widget(self._row(entry, app))
+            row = self._row(entry, app)
+            if entry.get("id") in arrivals:
+                row.opacity = 0.0
+                animate(row, theme.T_ENTER, theme.EASE_IN, opacity=1.0)
+            self.player_list.add_widget(row)
 
         # A dashed placeholder for the seat nobody is in yet. Hosting alone
         # with a bare list looks like the lobby failed to load; a slot that
@@ -182,12 +214,13 @@ class LobbyScreen(Screen):
         is_host = app.mode == "host"
         is_client = app.mode == "client"
 
-        self._set_visible(self.ready_button, is_client, theme.BUTTON_HEIGHT)
+        self._set_visible(self.ready_button, is_client,
+                          theme.BUTTON_HEIGHT_COMPACT)
         self.ready_button.text = ("READY - tap to cancel" if self._ready
                                   else "I'M READY")
 
         self._set_visible(self.start_button, not is_client,
-                          theme.BUTTON_HEIGHT)
+                          theme.BUTTON_HEIGHT_COMPACT)
         if is_host:
             everyone = app.host.everyone_ready() if app.host else True
             count = app.host.player_count() if app.host else 1
@@ -232,7 +265,7 @@ class LobbyScreen(Screen):
         # a row from the sky perfectly well, and dropping the stroke is most of
         # what makes the column feel calm.
         row = Card(orientation="horizontal", auto_height=False,
-                   size_hint_y=None, height=theme.ROW_HEIGHT,
+                   size_hint_y=None, height=theme.ROW_HEIGHT_COMPACT,
                    padding=(theme.SPACE_2, theme.SPACE_1),
                    spacing=theme.SPACE_2,
                    fill=theme.SURFACE, outline=(0, 0, 0, 0))
@@ -241,7 +274,7 @@ class LobbyScreen(Screen):
         # uses, so the avatar and the character you run as cannot disagree.
         row.add_widget(DinoAvatar(
             skin_index,
-            size=(theme.ROW_HEIGHT * 0.7, theme.ROW_HEIGHT * 0.7),
+            size=(theme.snap(theme.ROW_HEIGHT_COMPACT * 0.74),) * 2,
             pos_hint={"center_y": 0.5}))
 
         name = Label(text=str(entry.get("name", "Player")),
@@ -265,7 +298,8 @@ class LobbyScreen(Screen):
     @staticmethod
     def _open_slot(number: int) -> DashedCard:
         """The seat nobody is in yet."""
-        slot = DashedCard(size_hint_y=None, height=theme.ROW_HEIGHT,
+        slot = DashedCard(size_hint_y=None,
+                          height=theme.ROW_HEIGHT_COMPACT,
                           padding=(theme.SPACE_3, theme.SPACE_1),
                           orientation="horizontal")
         label = Label(text=f"Open slot  -  waiting for player {number}...",

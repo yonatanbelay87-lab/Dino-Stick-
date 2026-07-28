@@ -51,7 +51,7 @@ class JoinDialog(Dialog):
                                color=theme.FAINT)
         self.add_widget(self._status)
 
-        scroll = ScrollView(bar_width=dp(3), do_scroll_x=False)
+        scroll = ScrollView(bar_width=theme.SCROLLBAR_WIDTH, do_scroll_x=False)
         holder = BoxLayout(orientation="vertical", size_hint_y=None,
                            spacing=theme.GAP)
         holder.bind(minimum_height=holder.setter("height"))
@@ -256,7 +256,7 @@ class HowToDialog(Dialog):
     def __init__(self, **kw) -> None:
         super().__init__(title="How to play", dismiss_text="Got it", **kw)
 
-        scroll = ScrollView(bar_width=dp(3), do_scroll_x=False)
+        scroll = ScrollView(bar_width=theme.SCROLLBAR_WIDTH, do_scroll_x=False)
         column = BoxLayout(orientation="vertical", spacing=theme.GAP,
                            size_hint_y=None, padding=(0, 0, theme.GAP, 0))
         column.bind(minimum_height=column.setter("height"))
@@ -322,7 +322,7 @@ class CreditsDialog(Dialog):
     def __init__(self, **kw) -> None:
         super().__init__(title="Who made this", dismiss_text="Back", **kw)
 
-        scroll = ScrollView(bar_width=dp(3), do_scroll_x=False)
+        scroll = ScrollView(bar_width=theme.SCROLLBAR_WIDTH, do_scroll_x=False)
         column = BoxLayout(orientation="vertical", spacing=theme.SPACE_3,
                            size_hint_y=None, padding=(0, 0, theme.SPACE_2, 0))
         column.bind(minimum_height=column.setter("height"))

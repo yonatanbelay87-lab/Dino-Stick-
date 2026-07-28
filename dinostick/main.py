@@ -27,7 +27,8 @@ from kivy.clock import Clock  # noqa: E402
 from kivy.core.window import Window  # noqa: E402
 from kivy.logger import Logger  # noqa: E402
 from kivy.uix.modalview import ModalView  # noqa: E402
-from kivy.uix.screenmanager import NoTransition, ScreenManager  # noqa: E402
+from kivy.uix.screenmanager import (FadeTransition, NoTransition,  # noqa: E402
+                                    ScreenManager)
 
 from game import constants as C  # noqa: E402
 from game import timing  # noqa: E402
@@ -36,9 +37,10 @@ from net import protocol  # noqa: E402
 from net.client import GameClient  # noqa: E402
 from net.discovery import HostAnnouncer, get_local_ip  # noqa: E402
 from net.host import GameHost  # noqa: E402
-from screens import GAME, GAMEOVER, LOBBY, MENU  # noqa: E402
+from screens import GAME, GAMEOVER, LOADING, LOBBY, MENU  # noqa: E402
 from screens.game import GameScreen  # noqa: E402
 from screens.gameover import GameOverScreen  # noqa: E402
+from screens.loading import LoadingScreen  # noqa: E402
 from screens.lobby import LobbyScreen  # noqa: E402
 from screens.menu import MenuScreen  # noqa: E402
 from ui import fonts  # noqa: E402
@@ -116,12 +118,14 @@ class DinoStickApp(App):
         self.snapshots: deque = deque(maxlen=C.SNAPSHOT_BUFFER)
         self.last_gameover: dict | None = None
 
-        sm = ScreenManager(transition=NoTransition())
+        sm = ScreenManager(transition=self._transition())
+        sm.add_widget(LoadingScreen(name=LOADING))
         sm.add_widget(MenuScreen(name=MENU))
         sm.add_widget(LobbyScreen(name=LOBBY))
         sm.add_widget(GameScreen(name=GAME))
         sm.add_widget(GameOverScreen(name=GAMEOVER))
-        sm.current = MENU
+        # The boot screen is the first thing shown and is never returned to.
+        sm.current = LOADING
         self.sm = sm
 
         # One pump for all network traffic. Every socket thread hands us plain
@@ -131,6 +135,19 @@ class DinoStickApp(App):
 
         Window.bind(on_keyboard=self._on_back)
         return sm
+
+    @staticmethod
+    def _transition():
+        """Cross-fade between screens, unless the player wants less motion.
+
+        A fade rather than a slide: the shell screens all share the same sunset
+        background, so sliding would drag the identical scene sideways behind
+        the content and read as a glitch. Kept to ~0.2s -- long enough to feel
+        deliberate, short enough that it never gets in the way of a rematch.
+        """
+        if theme.REDUCE_MOTION:
+            return NoTransition()
+        return FadeTransition(duration=0.22)
 
     # -- Android Back ------------------------------------------------------
 
@@ -151,6 +168,8 @@ class DinoStickApp(App):
             return False
 
         current = self.sm.current
+        if current == LOADING:
+            return True  # swallow it: there is nothing to go back to yet
         if current == GAME:
             # Asks first -- see GameScreen.request_exit. Back is an edge swipe
             # in landscape and gets hit by accident.

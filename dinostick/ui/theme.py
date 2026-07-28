@@ -27,6 +27,8 @@ below exist for the background painter and for nothing else.
 
 from __future__ import annotations
 
+import math
+
 from kivy.metrics import dp, sp
 
 from game import constants as C
@@ -35,6 +37,33 @@ from .fonts import BODY, DISPLAY, MONO
 # ---------------------------------------------------------------------------
 # Scene palette -- the literal art direction
 # ---------------------------------------------------------------------------
+
+
+def snap(value: float) -> float:
+    """Round to a whole device pixel.
+
+    This is what "pixel perfect" actually means on a phone. ``dp()`` and
+    ``sp()`` multiply by a fractional density -- 2.75 on a 1080p phone, 2.625
+    on plenty of others -- so a 14sp line height comes out at 61.2px and a card
+    at 255.6px. Draw a 1px border or a rounded corner on a half pixel and the
+    GPU spreads it across two, which is exactly the softness that reads as
+    "not quite right" without ever looking obviously broken.
+
+    Applied to the geometry that has EDGES: card fills, button faces, outlines,
+    badges, type-derived heights. Not to the dino art, where a half pixel is
+    invisible against a silhouette.
+    """
+    return float(round(value))
+
+
+def snap_up(value: float) -> float:
+    """Round UP to a whole device pixel.
+
+    For anything with a MINIMUM that must not be violated -- touch targets,
+    hairline widths. Plain rounding can shave half a pixel off a 48dp target,
+    and 47.8dp is a compliance bug rather than a rounding detail.
+    """
+    return float(math.ceil(value - 1e-6))
 
 
 def rgba(value: int, alpha: float = 1.0) -> tuple[float, float, float, float]:
@@ -200,12 +229,17 @@ FONT_CAPTION = sp(12)  # the little uppercase word above a value
 # was 4/6/8/10/12 -- five values, three of them a couple of pixels apart, which
 # is how the same "gap" ended up looking different on every screen.
 
-SPACE_1 = dp(4)
-SPACE_2 = dp(8)
-SPACE_3 = dp(12)
-SPACE_4 = dp(16)
-SPACE_5 = dp(24)
-SPACE_6 = dp(32)
+# Snapped at definition, not at draw time. Density is fractional on most
+# phones -- 2.625 is common -- so dp(12) is 31.5px, two of those is 63px, and
+# every sum downstream inherits the half pixel. Rounding the scale once here
+# means padding, gaps, column widths and card heights are all whole pixels by
+# construction instead of being corrected shape by shape.
+SPACE_1 = snap(dp(4))
+SPACE_2 = snap(dp(8))
+SPACE_3 = snap(dp(12))
+SPACE_4 = snap(dp(16))
+SPACE_5 = snap(dp(24))
+SPACE_6 = snap(dp(32))
 
 PAD = SPACE_3
 PAD_SM = SPACE_2
@@ -225,34 +259,54 @@ EDGE = SPACE_3
 # Gap down the middle of a two-column shell screen.
 COLUMN_GAP = SPACE_5
 
-RADIUS = dp(16)
-RADIUS_SM = dp(10)
+RADIUS = snap(dp(16))
+RADIUS_SM = snap(dp(10))
 RADIUS_PILL = dp(999)  # clamped to half the height by the drawing code
-BORDER_WIDTH = dp(1.1)
+# snap_up, so a hairline is never rounded away to nothing on a low-density
+# screen. This is the classic 1px-border problem: at 1.5x density a 1.1dp rule
+# is 1.65px and straddles two rows of pixels, reading as a soft grey smear
+# instead of a line.
+BORDER_WIDTH = snap_up(dp(1.1))
+# Scrollbars are rarely seen (the shell does not scroll) but when they are,
+# a 7.88px bar is a fuzzy grey stripe.
+SCROLLBAR_WIDTH = snap(dp(3))
 
 # The solid band under a candy button's top face -- what makes it read as a
 # physical key rather than a rectangle. It is also the distance the face
 # travels on press, so it has to be big enough to SEE at arm's length and small
 # enough not to eat the label's room.
-CANDY_DEPTH = dp(6)
-CANDY_DEPTH_SMALL = dp(4)
+CANDY_DEPTH = snap(dp(6))
+CANDY_DEPTH_SMALL = snap(dp(4))
 
 # Android's minimum recommended touch target is 48dp. Menu buttons sit above
 # it -- they are hit with a thumb while gripping the phone in landscape -- but
 # not so far above that four of them stop fitting on screen. The depth is part
 # of the footprint, not on top of it, so the FACE stays comfortably tappable.
-TOUCH_MIN = dp(48)
-BUTTON_HEIGHT = dp(58)
-BUTTON_HEIGHT_SMALL = dp(48)
+# snap_up on the touch floor: this number is a guarantee, so it may round up
+# but never down.
+TOUCH_MIN = snap_up(dp(48))
+BUTTON_HEIGHT = snap(dp(58))
+BUTTON_HEIGHT_SMALL = snap_up(dp(48))
+
+# For screens that are genuinely tight on a 360dp-tall phone -- the lobby,
+# which stacks a picker and two buttons in one column. The FACE lands on
+# exactly 48dp, Android's floor, with the thickness band accounted for on
+# top. This is as small as a candy button is allowed to get: anything less
+# and the thing you press is under the minimum target, which is a
+# correctness bug, not a style choice.
+BUTTON_HEIGHT_COMPACT = TOUCH_MIN + CANDY_DEPTH  # 54dp footprint
+
+# Roster lines are read, not tapped, so they may go below the touch floor.
+ROW_HEIGHT_COMPACT = snap(dp(42))
 
 # Menus are a centred column, not full-bleed: stretched across a 20:9 phone in
 # landscape a single button becomes an absurd 2000px-wide bar.
-CONTENT_MAX_WIDTH = dp(520)
+CONTENT_MAX_WIDTH = snap(dp(520))
 # ...and a two-column screen gets the whole safe width, capped so a tablet does
 # not push the two halves to opposite walls.
-SCENE_MAX_WIDTH = dp(880)
+SCENE_MAX_WIDTH = snap(dp(880))
 
-ROW_HEIGHT = dp(48)  # a roster line, at the touch-target floor
+ROW_HEIGHT = snap_up(dp(48))  # a roster line, at the touch-target floor
 CARD_PAD = SPACE_3
 
 # ---------------------------------------------------------------------------

@@ -19,7 +19,8 @@ from __future__ import annotations
 from typing import Callable
 
 from kivy.animation import Animation
-from kivy.graphics import (Color, Ellipse, Line, Rectangle, RoundedRectangle,
+from kivy.graphics import (Color, Ellipse, Line, PopMatrix, PushMatrix,
+                           Rectangle, Rotate, RoundedRectangle, Scale,
                            Triangle)
 from kivy.metrics import dp
 from kivy.properties import NumericProperty, StringProperty
@@ -83,18 +84,19 @@ class _RoundedBackground:
         self._sync_background()
 
     def _sync_background(self, *_) -> None:
-        radius = min(self._radius, min(self.size) * 0.5) if min(
-            self.size) > 0 else self._radius
-        self._fill_rect.pos = self.pos
-        self._fill_rect.size = self.size
+        x, y = theme.snap(self.x), theme.snap(self.y)
+        w, h = theme.snap(self.width), theme.snap(self.height)
+        radius = theme.snap(min(self._radius, min(w, h) * 0.5)
+                            if min(w, h) > 0 else self._radius)
+        self._fill_rect.pos = (x, y)
+        self._fill_rect.size = (w, h)
         self._fill_rect.radius = [radius]
         # Inset by half the stroke so the outline sits inside the shape rather
         # than straddling the edge, which reads as a blurry double border.
         inset = theme.BORDER_WIDTH * 0.5
         self._outline_line.rounded_rectangle = (
-            self.x + inset, self.y + inset,
-            max(0.0, self.width - 2 * inset), max(0.0, self.height - 2 * inset),
-            radius)
+            x + inset, y + inset,
+            max(0.0, w - 2 * inset), max(0.0, h - 2 * inset), radius)
 
     def _set_fill(self, fill, outline=None) -> None:
         self._fill_color.rgba = fill
@@ -218,38 +220,39 @@ class CandyButton(ButtonBehavior, FloatLayout):
     def _sync_layout(self, *_) -> None:
         if self.width <= 0 or self.height <= 0:
             return
-        face_h = max(1.0, self.height - self.depth)
-        face_y = self.y + self.lift
-        radius = [min(theme.RADIUS, face_h * 0.5)]
+        x, w = theme.snap(self.x), theme.snap(self.width)
+        base_y = theme.snap(self.y)
+        face_h = theme.snap(max(1.0, self.height - self.depth))
+        face_y = theme.snap(self.y + self.lift)
+        radius = [theme.snap(min(theme.RADIUS, face_h * 0.5))]
 
         # The band runs from the footprint's floor up to the top of the face,
         # so pressing the face down collapses the band behind it rather than
         # leaving a slab poking out of the top.
-        band_h = max(1.0, self.lift + face_h)
-        self._deep_rect.pos = (self.x, self.y)
-        self._deep_rect.size = (self.width, band_h)
+        band_h = max(1.0, (face_y - base_y) + face_h)
+        self._deep_rect.pos = (x, base_y)
+        self._deep_rect.size = (w, band_h)
         self._deep_rect.radius = radius
 
-        self._face_rect.pos = (self.x, face_y)
-        self._face_rect.size = (self.width, face_h)
+        self._face_rect.pos = (x, face_y)
+        self._face_rect.size = (w, face_h)
         self._face_rect.radius = radius
 
         spread = theme.SPACE_1
-        self._glow_rect.pos = (self.x - spread, self.y - spread)
-        self._glow_rect.size = (self.width + 2 * spread,
-                                band_h + 2 * spread)
+        self._glow_rect.pos = (x - spread, base_y - spread)
+        self._glow_rect.size = (w + 2 * spread, band_h + 2 * spread)
         self._glow_rect.radius = [radius[0] + spread]
 
         inset = theme.BORDER_WIDTH * 0.5
         self._outline_line.rounded_rectangle = (
-            self.x + inset, face_y + inset,
-            max(0.0, self.width - 2 * inset), max(0.0, face_h - 2 * inset),
+            x + inset, face_y + inset,
+            max(0.0, w - 2 * inset), max(0.0, face_h - 2 * inset),
             radius[0])
 
         # The label rides the face.
-        self._label.size = (max(0.0, self.width - 2 * theme.SPACE_3), face_h)
+        self._label.size = (max(0.0, w - 2 * theme.SPACE_3), face_h)
         self._label.text_size = self._label.size
-        self._label.pos = (self.x + theme.SPACE_3, face_y)
+        self._label.pos = (x + theme.SPACE_3, face_y)
 
     # -- state --------------------------------------------------------------
 
@@ -315,10 +318,10 @@ class IconButton(CandyButton):
         self._sync_icon()
 
     def _sync_icon(self, *_) -> None:
-        face_h = max(1.0, self.height - self.depth)
-        cx = self.center_x
-        cy = self.y + self.lift + face_h * 0.5
-        r = min(self.width, face_h) * 0.20
+        face_h = theme.snap(max(1.0, self.height - self.depth))
+        cx = theme.snap(self.center_x)
+        cy = theme.snap(self.y + self.lift + face_h * 0.5)
+        r = theme.snap(min(self.width, face_h) * 0.20)
         self._stroke_b.points = []
 
         if self._icon in ("<", ">"):
@@ -369,17 +372,24 @@ class Title(Label):
             font_size=size,
             font_name=theme.FONT_DISPLAY_NAME,
             size_hint_y=None,
-            height=size * 1.5,
+            height=theme.snap(size * 1.5),
             **kw,
         )
-        offset = max(dp(2), size * 0.055)
+        offset = theme.snap(max(dp(2), size * 0.055))
         with self.canvas.before:
             self._shadow_color = Color(*theme.INK[:3], 0.55)
             self._shadow = Rectangle()
         self._offset = offset
-        self.bind(pos=self._sync_shadow, size=self._sync_shadow,
-                  texture=self._sync_shadow, text_size=self._sync_shadow)
+        # texture_size, not just texture. Kivy REUSES the Texture object
+        # when a label re-lays-out, so binding to `texture` alone never
+        # fired: the shadow kept the geometry from before text_size was
+        # applied, and with halign="left" that left it centred while the
+        # real ink sat left. The heading rendered as a visible second copy
+        # -- "LOBBYLOBBY".
         self.bind(size=lambda w, *_: setattr(w, "text_size", (w.width, None)))
+        self.bind(pos=self._sync_shadow, size=self._sync_shadow,
+                  texture=self._sync_shadow, texture_size=self._sync_shadow,
+                  text_size=self._sync_shadow)
         self._sync_shadow()
 
     def _sync_shadow(self, *_) -> None:
@@ -389,8 +399,11 @@ class Title(Label):
         tw, th = self.texture_size
         self._shadow.texture = self.texture
         self._shadow.size = (tw, th)
-        self._shadow.pos = (int(self.center_x - tw * 0.5 + self._offset),
-                            int(self.center_y - th * 0.5 - self._offset))
+        # The same formula Kivy's own <Label> rule uses for the real
+        # texture, so the two can only ever differ by the offset.
+        self._shadow.pos = (
+            theme.snap(self.center_x - tw * 0.5 + self._offset),
+            theme.snap(self.center_y - th * 0.5 - self._offset))
 
 
 class GameTitle(Widget):
@@ -455,10 +468,10 @@ class Caption(Label):
             font_size=size,
             color=color or theme.GROUND,
             size_hint_y=None,
-            height=size * 1.7,
+            height=theme.snap(size * 1.7),
             **kw,
         )
-        self._min_height = size * 1.7
+        self._min_height = theme.snap(size * 1.7)
         self.bind(width=lambda *_: setattr(self, "text_size",
                                            (self.width, None)),
                   texture_size=self._grow)
@@ -467,7 +480,7 @@ class Caption(Label):
         # Grow to fit. A fixed one-line height silently clipped the second line
         # off every two-line caption ("Co-op endless runner / One rope."), and
         # a caption that has been cut in half is worse than no caption.
-        self.height = max(self._min_height, texture_size[1])
+        self.height = theme.snap(max(self._min_height, texture_size[1]))
 
 
 class Chip(ButtonBehavior, Label):
@@ -487,12 +500,12 @@ class Chip(ButtonBehavior, Label):
             font_name=theme.FONT_BODY_NAME,
             color=theme.FG,
             size_hint_y=None,
-            height=max(theme.TOUCH_MIN, theme.FONT_SMALL * 2.6),
+            height=theme.snap(max(theme.TOUCH_MIN, theme.FONT_SMALL * 2.6)),
             **kw,
         )
         # Hug the text rather than filling the column.
         self.bind(texture_size=lambda _w, s: setattr(
-            self, "width", s[0] + 2 * theme.SPACE_5))
+            self, "width", theme.snap(s[0] + 2 * theme.SPACE_5)))
         with self.canvas.before:
             self._fill = Color(*theme.SURFACE)
             self._rect = RoundedRectangle()
@@ -504,16 +517,53 @@ class Chip(ButtonBehavior, Label):
         self._sync()
 
     def _sync(self, *_) -> None:
-        radius = self.height * 0.5
-        self._rect.pos = self.pos
-        self._rect.size = self.size
+        x, y = theme.snap(self.x), theme.snap(self.y)
+        w, h = theme.snap(self.width), theme.snap(self.height)
+        radius = h * 0.5
+        self._rect.pos = (x, y)
+        self._rect.size = (w, h)
         self._rect.radius = [radius]
-        self._line.rounded_rectangle = (self.x, self.y, self.width,
-                                        self.height, radius)
+        self._line.rounded_rectangle = (x, y, w, h, radius)
 
     def _sync_state(self, *_) -> None:
         self._fill.rgba = (theme.SURFACE_ALT if self.state == "down"
                            else theme.SURFACE)
+
+
+class Pop(FloatLayout):
+    """A container that can be scaled and spun about its own centre.
+
+    Kivy widgets have no transform of their own, so "bounce this in" normally
+    turns into animating a font size -- which re-renders the glyph texture every
+    frame and is genuinely expensive for a 52sp wordmark. A matrix around the
+    canvas is free by comparison: the texture is rendered once and the GPU does
+    the rest.
+
+    Animate ``scale`` for a pop and ``spin`` for a flip. Both are plain Kivy
+    properties, so ``Animation`` drives them directly.
+    """
+
+    scale = NumericProperty(1.0)
+    spin = NumericProperty(0.0)  # degrees, anticlockwise
+
+    def __init__(self, **kw) -> None:
+        super().__init__(**kw)
+        with self.canvas.before:
+            PushMatrix()
+            self._rotate = Rotate(angle=0.0, axis=(0, 0, 1))
+            self._scale = Scale(1.0, 1.0, 1.0)
+        with self.canvas.after:
+            PopMatrix()
+        self.bind(pos=self._sync_transform, size=self._sync_transform,
+                  scale=self._sync_transform, spin=self._sync_transform)
+        self._sync_transform()
+
+    def _sync_transform(self, *_) -> None:
+        centre = self.center
+        self._rotate.origin = centre
+        self._rotate.angle = self.spin
+        self._scale.origin = centre
+        self._scale.x = self._scale.y = self.scale
 
 
 class TextLink(ButtonBehavior, Label):
@@ -634,21 +684,25 @@ class DashedCard(BoxLayout):
         self._sync()
 
     def _sync(self, *_) -> None:
-        self._line.rounded_rectangle = (self.x, self.y, self.width,
-                                        self.height, theme.RADIUS)
+        self._line.rounded_rectangle = (
+            theme.snap(self.x), theme.snap(self.y),
+            theme.snap(self.width), theme.snap(self.height),
+            theme.snap(theme.RADIUS))
 
 
 class Divider(Widget):
     def __init__(self, **kw) -> None:
-        super().__init__(size_hint_y=None, height=theme.BORDER_WIDTH, **kw)
+        super().__init__(size_hint_y=None,
+                         height=max(1.0, theme.snap(theme.BORDER_WIDTH)),
+                         **kw)
         with self.canvas:
             Color(*theme.BORDER)
             self._rect = Rectangle(pos=self.pos, size=self.size)
         self.bind(pos=self._sync, size=self._sync)
 
     def _sync(self, *_) -> None:
-        self._rect.pos = self.pos
-        self._rect.size = self.size
+        self._rect.pos = (theme.snap(self.x), theme.snap(self.y))
+        self._rect.size = (theme.snap(self.width), theme.snap(self.height))
 
 
 class Badge(Label):
@@ -670,7 +724,7 @@ class Badge(Label):
             # Derived from the type, not a fixed 20dp: sp() grows with the
             # user's system font-size setting, and a hard height clipped the
             # descenders off "READY" on anything above 100%.
-            height=max(dp(22), theme.FONT_CAPTION * 1.9),
+            height=theme.snap(max(dp(22), theme.FONT_CAPTION * 1.9)),
             **kw,
         )
         with self.canvas.before:
@@ -683,35 +737,64 @@ class Badge(Label):
         self._sync()
 
     def _sync(self, *_) -> None:
-        self.width = self.texture_size[0] + 2 * theme.SPACE_2
-        radius = self.height * 0.5
-        self._rect.pos = self.pos
-        self._rect.size = self.size
+        self.width = theme.snap(self.texture_size[0] + 2 * theme.SPACE_2)
+        x, y = theme.snap(self.x), theme.snap(self.y)
+        w, h = theme.snap(self.width), theme.snap(self.height)
+        radius = h * 0.5
+        self._rect.pos = (x, y)
+        self._rect.size = (w, h)
         self._rect.radius = [radius]
-        self._line.rounded_rectangle = (self.x, self.y, self.width,
-                                        self.height, radius)
+        self._line.rounded_rectangle = (x, y, w, h, radius)
 
 
 class LiveDot(Widget):
-    """A small green dot that says the session is up. Blinks in Phase 3."""
+    """A small green dot with a slow heartbeat: the session is up.
+
+    A static dot reads as an icon; a pulsing one reads as a signal. It is
+    the only thing on the lobby that says "this is live and listening"
+    while nothing else is moving.
+
+    The pulse is opt-in via start_pulse() rather than automatic, because a
+    looping Animation on a screen nobody is looking at is pure waste --
+    the lobby starts it on enter and stops it on leave.
+    """
+
+    pulse = NumericProperty(0.0)  # 0 = resting, 1 = fully expanded
 
     def __init__(self, diameter: float | None = None, **kw) -> None:
-        size = diameter or dp(10)
+        size = theme.snap(diameter or dp(10))
         super().__init__(size_hint=(None, None), size=(size, size), **kw)
         with self.canvas:
             self.halo_color = Color(*theme.DINO[:3], 0.35)
             self._halo = Ellipse()
             self.dot_color = Color(*theme.DINO)
             self._dot = Ellipse()
-        self.bind(pos=self._sync, size=self._sync)
+        self.bind(pos=self._sync, size=self._sync, pulse=self._sync)
         self._sync()
 
+    def start_pulse(self) -> None:
+        Animation.cancel_all(self, "pulse")
+        if theme.REDUCE_MOTION:
+            self.pulse = 0.35
+            return
+        beat = (Animation(pulse=1.0, d=0.75, t="out_sine")
+                + Animation(pulse=0.0, d=0.75, t="in_sine"))
+        beat.repeat = True
+        beat.start(self)
+
+    def stop_pulse(self) -> None:
+        Animation.cancel_all(self, "pulse")
+        self.pulse = 0.0
+
     def _sync(self, *_) -> None:
-        spread = self.width * 0.7
-        self._halo.pos = (self.x - spread * 0.5, self.y - spread * 0.5)
-        self._halo.size = (self.width + spread, self.height + spread)
-        self._dot.pos = self.pos
-        self._dot.size = self.size
+        x, y = theme.snap(self.x), theme.snap(self.y)
+        w, h = theme.snap(self.width), theme.snap(self.height)
+        spread = w * (0.55 + 0.85 * self.pulse)
+        self.halo_color.a = 0.40 * (1.0 - self.pulse * 0.75)
+        self._halo.pos = (x - spread * 0.5, y - spread * 0.5)
+        self._halo.size = (w + spread, h + spread)
+        self._dot.pos = (x, y)
+        self._dot.size = (w, h)
 
 
 class Dot(Widget):
@@ -783,9 +866,15 @@ class DinoAvatar(Widget):
 
         with self.canvas:
             if self._framed:
+                # The tile is the one part of this widget with a hard
+                # edge, so it gets snapped; the silhouette inside does
+                # not, because a half pixel is invisible on a shape with
+                # no outline.
                 Color(*theme.CREAM[:3], 0.93)
-                RoundedRectangle(pos=self.pos, size=self.size,
-                                 radius=[min(self.size) * 0.28])
+                fx, fy = theme.snap(self.x), theme.snap(self.y)
+                fw, fh = theme.snap(self.width), theme.snap(self.height)
+                RoundedRectangle(pos=(fx, fy), size=(fw, fh),
+                                 radius=[theme.snap(min(fw, fh) * 0.28)])
             for part in spec["parts"]:
                 Color(*shade(base, part.get("s", 1.0)))
                 kind = part["k"]
@@ -828,9 +917,14 @@ class DinoPicker(Card):
         kw.setdefault("auto_height", False)
         kw.setdefault("size_hint_y", None)
         kw.setdefault("spacing", theme.SPACE_2)
+        kw.setdefault("padding", theme.SPACE_2)
         super().__init__(**kw)
-        self.height = max(dp(88), theme.TOUCH_MIN + theme.CANDY_DEPTH
-                          + theme.FONT_CAPTION * 1.8)
+        # Was dp(88), which on a 360dp-tall phone is a quarter of the
+        # column for a cosmetic choice. The arrows keep their 48dp targets
+        # -- only the surrounding air shrinks.
+        self.height = theme.snap(max(dp(74), theme.TOUCH_MIN
+                                     + theme.CANDY_DEPTH
+                                     + theme.FONT_SMALL * 1.6))
         self._on_change = on_change
         self._skin = skin
 
@@ -842,14 +936,16 @@ class DinoPicker(Card):
                                    pos_hint={"center_y": 0.5}))
 
         middle = BoxLayout(orientation="vertical", spacing=0)
-        self.avatar = DinoAvatar(skin, pos_hint={"center_x": 0.5})
+        self.avatar = DinoAvatar(skin, size=(dp(36), dp(36)),
+                                 pos_hint={"center_x": 0.5})
         avatar_row = AnchorLayout(anchor_x="center", anchor_y="center")
         avatar_row.add_widget(self.avatar)
         middle.add_widget(avatar_row)
         self.name_label = Label(
-            text="", font_size=theme.FONT_BODY,
+            text="", font_size=theme.FONT_SMALL,
             font_name=theme.FONT_DISPLAY_NAME, color=theme.FG,
-            size_hint_y=None, height=theme.FONT_BODY * 1.5,
+            size_hint_y=None,
+            height=theme.snap(theme.FONT_SMALL * 1.6),
             halign="center", valign="middle")
         self.name_label.bind(size=lambda w, *_: setattr(
             w, "text_size", (w.width, w.height)))
@@ -887,12 +983,13 @@ class Stat(BoxLayout):
             text=caption.upper(), font_size=theme.FONT_CAPTION,
             font_name=theme.FONT_BODY_NAME,
             color=caption_color or theme.FAINT,
-            size_hint_y=None, height=theme.FONT_CAPTION * 1.6,
+            size_hint_y=None,
+            height=theme.snap(theme.FONT_CAPTION * 1.6),
             halign=halign, valign="bottom")
         self.value_label = Label(
             text=value, font_size=value_size, color=value_color or theme.FG,
             font_name=theme.FONT_DISPLAY_NAME,
-            size_hint_y=None, height=value_size * 1.35,
+            size_hint_y=None, height=theme.snap(value_size * 1.35),
             halign=halign, valign="top")
         for label in (self.caption_label, self.value_label):
             label.bind(size=lambda w, *_: setattr(w, "text_size",
@@ -978,7 +1075,7 @@ class _Column(ScrollView):
     lead = NumericProperty(0.0)
 
     def __init__(self, align: str = "center", **kw) -> None:
-        super().__init__(size_hint=(None, None), bar_width=dp(3),
+        super().__init__(size_hint=(None, None), bar_width=theme.SCROLLBAR_WIDTH,
                          do_scroll_x=False, do_scroll_y=False,
                          effect_cls="ScrollEffect", **kw)
         # "center" suits a column whose content is a balanced block. "top"
@@ -1138,15 +1235,21 @@ class Panel(FloatLayout):
         avail_h = max(theme.SPACE_4, sh - 2 * theme.EDGE)
         origin_y = self.y + sy + theme.EDGE
 
+        # Snapped: a column is the frame every card inside it is measured
+        # against, so half a pixel here drifts the two halves out of alignment
+        # with each other even though each card rounds its own fill.
+        avail_h = theme.snap(avail_h)
         if self.columns == 1:
-            width = min(avail_w, theme.CONTENT_MAX_WIDTH)
+            width = theme.snap(min(avail_w, theme.CONTENT_MAX_WIDTH))
             self.col_left.size = (width, avail_h)
-            self.col_left.pos = (self.x + sx + (sw - width) * 0.5, origin_y)
+            self.col_left.pos = (theme.snap(self.x + sx + (sw - width) * 0.5),
+                                 theme.snap(origin_y))
             return
 
         total = min(avail_w, theme.SCENE_MAX_WIDTH)
-        column = (total - theme.COLUMN_GAP) * 0.5
-        start = self.x + sx + (sw - total) * 0.5
+        column = theme.snap((total - theme.COLUMN_GAP) * 0.5)
+        start = theme.snap(self.x + sx + (sw - total) * 0.5)
+        origin_y = theme.snap(origin_y)
         self.col_left.size = (column, avail_h)
         self.col_left.pos = (start, origin_y)
         self.col_right.size = (column, avail_h)
