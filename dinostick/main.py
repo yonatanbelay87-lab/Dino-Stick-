@@ -37,13 +37,15 @@ from net.client import GameClient  # noqa: E402
 from net.discovery import HostAnnouncer, get_local_ip  # noqa: E402
 from net.host import GameHost  # noqa: E402
 from net.peers import wrap_if_simulating  # noqa: E402
-from screens import GAME, GAMEOVER, LOADING, LOBBY, MENU  # noqa: E402
+from screens import GAME, GAMEOVER, LOBBY, MENU  # noqa: E402
 from screens.game import GameScreen  # noqa: E402
 from screens.gameover import GameOverScreen  # noqa: E402
-from screens.loading import LoadingScreen  # noqa: E402
 from screens.lobby import LobbyScreen  # noqa: E402
 from screens.menu import MenuScreen  # noqa: E402
+from ui import audio  # noqa: E402
 from ui import fonts  # noqa: E402
+from ui import highscores  # noqa: E402
+from ui import scene as scene_mod  # noqa: E402
 from ui import settings  # noqa: E402
 from ui import theme  # noqa: E402
 from ui.insets import insets  # noqa: E402
@@ -122,24 +124,36 @@ class DinoStickApp(App):
         # This device's half of a networked run. Host and joiner both get one,
         # and they are the same class -- see game/coop.py.
         self.session: CoopSession | None = None
+        # Address currently being dialled, for the lobby's status line and for
+        # a failure message that names what could not be reached.
+        self._join_target: str = ""
 
         stored = settings.load(self.user_data_dir)
         self.player_name: str = stored["player_name"]
         self.skin: int = int(stored["skin"]) % len(C.SKIN_NAMES)
+        highscores.load(self.user_data_dir)
+
         # id -> (name, skin), for the nameplates over each dino.
         self.roster: dict[int, tuple[str, int]] = {}
         self.lobby_players: list[dict] = []
         self.last_gameover: dict | None = None
 
+        # Build ONLY the menu before returning. Everything else -- the lobby,
+        # the game screen, the game-over card -- is constructed on the next
+        # frame, once the player is already looking at something.
+        #
+        # Measured on desktop, cold: GameScreen() alone cost 1121 ms of the
+        # 2439 ms it took to reach the first frame, almost all of it the
+        # audio.preload() that used to sit in its __init__ (the first
+        # SoundLoader.load opens the audio device: 910 ms for the first file,
+        # 0.5 ms for each of the other four). The Android presplash stays up
+        # for exactly as long as this takes, so every millisecond here is a
+        # millisecond of the player staring at an icon.
         sm = ScreenManager(transition=self._transition())
-        sm.add_widget(LoadingScreen(name=LOADING))
         sm.add_widget(MenuScreen(name=MENU))
-        sm.add_widget(LobbyScreen(name=LOBBY))
-        sm.add_widget(GameScreen(name=GAME))
-        sm.add_widget(GameOverScreen(name=GAMEOVER))
-        # The boot screen is the first thing shown and is never returned to.
-        sm.current = LOADING
+        sm.current = MENU
         self.sm = sm
+        self._screens_ready = False
 
         # One pump for all network traffic. Every socket thread hands us plain
         # dicts through a Queue; this is the only place they are consumed, and
@@ -148,6 +162,52 @@ class DinoStickApp(App):
 
         Window.bind(on_keyboard=self._on_back)
         return sm
+
+    def on_start(self) -> None:
+        """First frame is on screen. Now do the expensive things.
+
+        Split in two because the two halves have opposite constraints:
+
+          * audio goes to a WORKER thread, because opening the mixer takes the
+            better part of a second and touches no GL state;
+          * textures stay on THIS thread, because ``Texture.create`` is a GL
+            call and building one off-thread is undefined behaviour. They are
+            merely deferred by a frame, which is enough -- they cost well under
+            a millisecond each and are lazy anyway (ui/scene.py caches them on
+            first use); warming them here just moves that first use off the
+            frame where the player first sees the canyon.
+        """
+        Clock.schedule_once(self._build_remaining_screens, 0)
+        Clock.schedule_once(self._warm_up, 0)
+
+    def _build_remaining_screens(self, *_args) -> None:
+        """Construct the screens the menu can navigate to. Idempotent."""
+        if self._screens_ready:
+            return
+        self._screens_ready = True
+        self.sm.add_widget(LobbyScreen(name=LOBBY))
+        self.sm.add_widget(GameScreen(name=GAME))
+        self.sm.add_widget(GameOverScreen(name=GAMEOVER))
+
+    def ensure_screens(self) -> None:
+        """Called before any navigation, in case a tap beat the scheduler.
+
+        In practice the deferred build runs on the frame after the menu
+        appears and nobody is that fast. This exists so that "in practice" is
+        not load-bearing.
+        """
+        self._build_remaining_screens()
+
+    def _warm_up(self, *_args) -> None:
+        # As early as possible, deliberately. The load holds the GIL in chunks
+        # (see ui/audio.py), so the goal is to have it FINISHED before the
+        # player can plausibly touch anything -- not to move it out of the way.
+        audio.warm()
+        try:
+            scene_mod.sky_texture()
+            scene_mod.sun_texture()
+        except Exception:
+            pass  # a cold texture is a slower first draw, not a crash
 
     @staticmethod
     def _transition():
@@ -181,8 +241,6 @@ class DinoStickApp(App):
             return False
 
         current = self.sm.current
-        if current == LOADING:
-            return True  # swallow it: there is nothing to go back to yet
         if current == GAME:
             # Asks first -- see GameScreen.request_exit. Back is an edge swipe
             # in landscape and gets hit by accident.
@@ -213,15 +271,23 @@ class DinoStickApp(App):
         return True
 
     def join_game(self, ip: str, port: int = C.PORT_GAME) -> bool:
+        """Start connecting and return at once. Always True.
+
+        The connect itself happens on a worker thread (GameClient.connect_async)
+        because it can block for the whole SOCKET_TIMEOUT, and blocking here
+        blocks the Kivy thread -- which is what made the lobby appear with a
+        Ready button that ignored taps for seconds.
+
+        So the lobby opens immediately in a "Connecting..." state and unlocks
+        the moment the host's first lobby message lands. A failure comes back
+        through the same pump as any other message and bounces to the menu.
+        """
         self.leave_network()
         client = GameClient(name=self.player_name, skin=self.skin)
-        try:
-            client.connect(ip, port)
-        except OSError as exc:
-            self.sm.get_screen(MENU).show_error(f"Could not join {ip}: {exc}")
-            return False
         self.client = client
         self.mode = MODE_CLIENT
+        self._join_target = ip
+        client.connect_async(ip, port)
         return True
 
     def start_local(self) -> None:
@@ -241,6 +307,7 @@ class DinoStickApp(App):
         self.session = None
         self.roster.clear()
         self.lobby_players.clear()
+        self._join_target = ""
         self.mode = MODE_LOCAL
 
     def local_ip(self) -> str:
@@ -352,8 +419,7 @@ class DinoStickApp(App):
             host.push_lobby()
             if self.announcer is not None:
                 self.announcer.player_count = host.player_count()
-            if self.sm.current == LOBBY:
-                self.sm.get_screen(LOBBY).refresh()
+            self._refresh_lobby()
 
     def _pump_client(self) -> None:
         client = self.client
@@ -379,6 +445,12 @@ class DinoStickApp(App):
         # tick -- which is the point of having one. Draining it on the frame
         # pump would put it right back on the render loop's critical path.
 
+    def _refresh_lobby(self) -> None:
+        """Re-render the lobby, if it exists yet and is the screen on show."""
+        if not self._screens_ready or self.sm.current != LOBBY:
+            return
+        self.sm.get_screen(LOBBY).refresh()
+
     def _on_shared_event(self, msg: dict, relay: bool) -> None:
         """Apply one shared-world event here, and pass it on if we are hosting.
 
@@ -396,10 +468,28 @@ class DinoStickApp(App):
         kind = msg.get(protocol.TYPE)
 
         if kind == protocol.MSG_LOBBY:
+            # THE acknowledgement. The host answers a JOIN with the roster and
+            # our own player id on its socket thread, so this is the earliest
+            # possible moment we can be sure we are in the room -- and it is
+            # therefore the moment the Ready button becomes usable. refresh()
+            # reads client.player_id and unlocks it.
             self.lobby_players = msg.get("players", [])
             self.roster = {int(p["id"]): (p["name"], int(p["skin"]))
                            for p in self.lobby_players}
-            self.sm.get_screen(LOBBY).refresh()
+            self._refresh_lobby()
+
+        elif kind == "_connected":
+            # The socket is up; the JOIN has gone out and the roster is on its
+            # way. Tell the lobby so it can stop saying "Connecting...".
+            self._refresh_lobby()
+
+        elif kind == "_connect_failed":
+            where = self._join_target or "the host"
+            reason = str(msg.get("error", "")) or "no answer"
+            self.leave_network()
+            self.sm.get_screen(MENU).show_error(
+                f"Could not join {where}: {reason}")
+            self.sm.current = MENU
 
         elif kind == protocol.MSG_SEED:
             # The whole world, as one integer. START follows immediately and

@@ -8,9 +8,9 @@ from kivy.uix.screenmanager import Screen
 
 from game import constants as C
 from net import protocol
-from ui import theme
+from ui import highscores, theme
 from ui import format as fmt
-from ui.widgets import Caption, Card, MenuButton, Panel, Stat, Title
+from ui.widgets import Badge, Caption, Card, MenuButton, Panel, Stat, Title
 
 from . import GAME, MENU
 
@@ -18,6 +18,11 @@ from . import GAME, MENU
 class GameOverScreen(Screen):
     def __init__(self, **kw) -> None:
         super().__init__(**kw)
+        # Identifies the run currently on show, so a corrected score updates
+        # the same high-score row instead of adding a second one. A networked
+        # joiner calls show_result twice: once when it hears about the death,
+        # once when the host's authoritative GAME_OVER lands.
+        self._run_token: str | None = None
         root = Panel(columns=2)
 
         # -- left: what just happened ---------------------------------------
@@ -47,6 +52,12 @@ class GameOverScreen(Screen):
         self.cause_label = Caption("", theme.FONT_SMALL, color=theme.DANGER)
         root.col_left.add_widget(self.cause_label)
 
+        # Shown only when the run actually placed. A "you came 7th" line on
+        # every single run turns a personal best into noise.
+        self.record_badge = Badge("", color=theme.ACCENT, filled=True)
+        self.record_badge.opacity = 0.0
+        root.col_left.add_widget(self.record_badge)
+
         # -- right: what to do next -----------------------------------------
         self.rematch_button = MenuButton("PLAY AGAIN", self._rematch)
         root.col_right.add_widget(self.rematch_button)
@@ -74,6 +85,10 @@ class GameOverScreen(Screen):
         self.team_stat.set_value(f"{players} dino"
                                  f"{'' if players == 1 else 's'}")
 
+        # Every finished run funnels through here -- solo, host and joiner --
+        # so this is the one place a score has to be recorded.
+        self._record(score, distance, seconds, players)
+
         if cause_obstacle is None:
             self.cause_label.text = ""
             return
@@ -83,6 +98,29 @@ class GameOverScreen(Screen):
             self.cause_label.text = f"Player {cause_player_id + 1} hit {what}"
         else:
             self.cause_label.text = f"Crashed into {what}"
+
+    def _record(self, score: int, distance: float, seconds: float | None,
+                players: int) -> None:
+        app = App.get_running_app()
+        mode = app.mode if app is not None else "local"
+        self._run_token, rank = highscores.submit(
+            score=score, distance=distance, seconds=seconds, players=players,
+            mode=mode, token=self._run_token)
+
+        if rank == 1:
+            self.record_badge.text = "NEW BEST"
+        elif rank is not None and rank <= highscores.SHOWN:
+            self.record_badge.text = f"#{rank} BEST"
+        else:
+            self.record_badge.opacity = 0.0
+            return
+        self.record_badge.opacity = 1.0
+
+    def on_leave(self, *_args) -> None:
+        # The next run is a different run: a fresh token, so its score is a new
+        # row rather than an update of this one.
+        self._run_token = None
+        self.record_badge.opacity = 0.0
 
     def _rematch(self) -> None:
         app = App.get_running_app()

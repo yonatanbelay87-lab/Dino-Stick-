@@ -49,6 +49,10 @@ class GameClient:
         self.player_id: int | None = None
         self.connected = False
         self.error: str | None = None
+        # True from the moment connect_async is called until the socket is up
+        # or has failed. The lobby reads it to say "Connecting..." instead of
+        # showing controls that cannot work yet.
+        self.connecting = False
 
         # Round-trip time in seconds, smoothed. None until the first pong.
         self.rtt: float | None = None
@@ -75,11 +79,46 @@ class GameClient:
 
     # -- lifecycle ----------------------------------------------------------
 
+    def connect_async(self, ip: str, port: int = C.PORT_GAME) -> None:
+        """Connect on a worker thread. Returns immediately, never raises.
+
+        The blocking version below can sit on ``sock.connect`` for the whole
+        of SOCKET_TIMEOUT -- five seconds -- and it used to be called straight
+        from the join button. During those five seconds the Kivy thread is
+        stopped dead: the lobby is already the current screen, so the player
+        sees it and taps Ready, and nothing happens because no touch is being
+        dispatched at all. Every one of those taps is then delivered in a burst
+        when the socket finally answers. That is the "frozen Ready button".
+
+        The result is reported the same way every other socket thread reports
+        things -- as a message on ``inbox``, drained by the app's pump on the
+        main thread. Nothing here touches a widget.
+        """
+        if self.connecting or self.connected:
+            return
+        self.connecting = True
+        self.error = None
+        threading.Thread(target=self._connect_worker, args=(ip, port),
+                         daemon=True, name="dinostick-connect").start()
+
+    def _connect_worker(self, ip: str, port: int) -> None:
+        try:
+            self.connect(ip, port)
+        except OSError as exc:
+            self.connecting = False
+            self.error = str(exc)
+            self.inbox.put({protocol.TYPE: "_connect_failed",
+                            "error": str(exc)})
+            return
+        self.connecting = False
+        self.inbox.put({protocol.TYPE: "_connected"})
+
     def connect(self, ip: str, port: int = C.PORT_GAME) -> None:
         """Blocking connect. Raises OSError if the host is unreachable.
 
-        The only blocking socket call in the client, and it happens on a menu
-        button press rather than during a run.
+        Do not call this from the Kivy thread -- use ``connect_async``. It is
+        kept public and blocking because that is the right shape for a worker
+        thread and for the headless self-test.
         """
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(C.SOCKET_TIMEOUT)
@@ -206,6 +245,7 @@ class GameClient:
     def disconnect(self) -> None:
         self._stop.set()
         self.connected = False
+        self.connecting = False
         if self._udp is not None:
             try:
                 self._udp.close()

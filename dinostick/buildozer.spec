@@ -40,12 +40,24 @@ icon.filename = %(source.dir)s/assets/icon.png
 icon.adaptive_foreground.filename = %(source.dir)s/assets/icon_fg.png
 icon.adaptive_background.filename = %(source.dir)s/assets/icon_bg.png
 
-# The splash the user stares at while Python and Kivy boot -- several seconds
-# on a cold start. presplash_color fills the screen AROUND the square image,
-# which on a landscape phone is two tall bars down the sides, so it is sampled
-# from the image's own left/right edge columns rather than being a guess. It
-# used to be COLOR_BG; against the painted seasons that flashed pale grey
-# before the first dark frame landed.
+# The splash the user stares at while Python and Kivy boot. presplash_color
+# fills the screen AROUND the square image, which on a landscape phone is two
+# tall bars down the sides, so it is sampled from the image's own left/right
+# edge columns rather than being a guess. It used to be COLOR_BG; against the
+# painted seasons that flashed pale grey before the first dark frame landed.
+#
+# HOW LONG IT STAYS UP: there is no buildozer key for this, and looking for one
+# is a dead end. python-for-android shows the presplash from process start and
+# removes it when the Kivy window presents its FIRST FRAME. So the only lever
+# is how much work happens before that frame, which is why build() now creates
+# the menu and nothing else, and everything heavy moved into on_start (see
+# main.py). Measured on desktop: 2439 ms -> 1362 ms to first frame, and the
+# 2.5 s scripted boot animation that used to follow it is gone entirely.
+#
+# The keys below are the whole of the presplash surface area:
+#   presplash.filename        the image
+#   android.presplash_color   the colour filling the bars around it
+# Both are appearance only. Neither shortens the wait.
 presplash.filename = %(source.dir)s/assets/presplash.png
 android.presplash_color = #48705A
 

@@ -110,7 +110,12 @@ class GameScreen(Screen):
         self._mode = "local"
         self._dead_zone_top = theme.TOUCH_MIN * 2.0
         self._exit_dialog = None
-        audio.preload()
+        # No audio.preload() here. It looks like the obvious place -- load the
+        # sounds where the sounds are used -- but this __init__ runs during app
+        # startup, and the first SoundLoader.load opens the audio device: 910 ms
+        # measured, which was over a third of the time to the first frame. The
+        # warm-up now happens on a worker thread once the menu is up
+        # (DinoStickApp.on_start -> ui.audio.warm).
 
         root = FloatLayout()
 

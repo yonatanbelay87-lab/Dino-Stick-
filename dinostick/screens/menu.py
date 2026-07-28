@@ -20,7 +20,8 @@ from kivy.utils import platform
 
 from game import constants as C
 from net.discovery import ClientDiscovery
-from ui import fonts, settings, theme
+from ui import fonts, highscores, settings, theme
+from ui import format as fmt
 from ui.widgets import (Caption, Card, Chip, DashedCard, Dialog, DinoAvatar,
                         Divider, GameTitle, MenuButton, Panel, TextLink,
                         TouchButton, hug)
@@ -411,6 +412,82 @@ class CreditsDialog(Dialog):
         return card
 
 
+class HighScoreCard(Card):
+    """Your best runs on this device, sat directly above PLAY.
+
+    ONE row, and that is not a stylistic preference -- it is the only thing
+    that fits. The right column already spends about 240dp on four buttons
+    against roughly 340dp of safe height on a landscape phone, which leaves
+    almost no slack. Measured: a stacked version (heading, big number,
+    runners-up on their own lines) came to 134px and forced the whole column
+    to scroll on every phone size up to 780x360. As a single row it is 54px
+    and the column still fits without scrolling.
+
+    So: the best score reads large on the left, the next two ride along as
+    small faint text on the right, and the whole thing costs one line.
+
+    Collapses to zero height until there is a score to show. A card reading
+    "no scores yet" above the Play button is furniture in the way of the one
+    thing a new player is trying to do.
+    """
+
+    def __init__(self, **kw) -> None:
+        super().__init__(fill=theme.SURFACE_ALT, outline=theme.BORDER,
+                         auto_height=False, size_hint_y=None, height=0,
+                         opacity=0.0, orientation="horizontal",
+                         padding=(theme.SPACE_3, theme.SPACE_2),
+                         spacing=theme.SPACE_2, **kw)
+
+        self._caption = Caption("BEST", theme.FONT_CAPTION, color=theme.FAINT,
+                                halign="left", size_hint_x=None)
+        self._caption.width = dp(40)
+        self.add_widget(self._caption)
+
+        # The headline number, in the accent the game uses for score
+        # everywhere else, so the menu and the game-over card agree.
+        self._best = Label(text="0", font_size=theme.FONT_BODY,
+                           font_name=theme.FONT_DISPLAY_NAME,
+                           color=theme.ACCENT, size_hint_x=None,
+                           halign="left", valign="middle")
+        self._best.bind(texture_size=lambda w, s: setattr(w, "width", s[0]))
+        self.add_widget(self._best)
+
+        # Second and third, pushed to the far end: present, clearly secondary,
+        # and costing no extra height.
+        self._runners = Label(text="", font_size=theme.FONT_CAPTION,
+                              font_name=theme.FONT_BODY_NAME,
+                              color=theme.FAINT, halign="right",
+                              valign="middle", shorten=True,
+                              shorten_from="right")
+        self._runners.bind(size=lambda w, *_: setattr(
+            w, "text_size", (w.width, w.height)))
+        self.add_widget(self._runners)
+
+    def refresh(self) -> None:
+        """Read the table and re-render. Cheap: it is at most three rows."""
+        rows = highscores.top()
+        if not rows:
+            self.opacity = 0.0
+            self.height = 0
+            self.disabled = True
+            return
+
+        first = rows[0]
+        self._best.text = fmt.score(int(first.get("score", 0)))
+
+        # The supporting detail: how far the best run got, then the runners-up.
+        # Distance is what makes a score mean something.
+        bits = [fmt.distance(float(first.get("distance", 0.0)))]
+        for row in rows[1:]:
+            bits.append(fmt.score(int(row.get("score", 0))))
+        self._runners.text = "   -   ".join(bits)
+
+        self.opacity = 1.0
+        self.disabled = False
+        self.height = max(theme.ROW_HEIGHT_COMPACT,
+                          theme.FONT_BODY * 1.4 + 2 * theme.SPACE_2)
+
+
 class MenuScreen(Screen):
     """Two columns: identity on the left, the three ways to play on the right.
 
@@ -464,6 +541,10 @@ class MenuScreen(Screen):
         #
         # The subtitle tells the truth per platform: touch drives one dino, a
         # keyboard drives two.
+        # Your best runs, immediately above PLAY: it is the reason to press it.
+        self.high_scores = HighScoreCard()
+        root.col_right.add_widget(self.high_scores)
+
         solo = platform in ("android", "ios")
         root.col_right.add_widget(MenuButton(
             "PLAY", self._local,
@@ -481,6 +562,10 @@ class MenuScreen(Screen):
 
         self.add_widget(root)
         self._sync_name()
+        # Populated on launch from the table the app loaded during build(), so
+        # the card is correct on the very first frame rather than filling in a
+        # moment later.
+        self.high_scores.refresh()
 
     def on_pre_enter(self, *_args) -> None:
         # Coming back from a game: make sure nothing is still connected.
@@ -488,6 +573,8 @@ class MenuScreen(Screen):
         if app is not None:
             app.leave_network()
         self._sync_name()
+        # A run just ended, so this is where a new record shows up.
+        self.high_scores.refresh()
 
     # -- player name --------------------------------------------------------
 
@@ -529,6 +616,7 @@ class MenuScreen(Screen):
 
     def _host(self) -> None:
         app = App.get_running_app()
+        app.ensure_screens()
         if app.start_hosting():
             self.manager.current = LOBBY
 
@@ -536,12 +624,19 @@ class MenuScreen(Screen):
         JoinDialog(on_join=self._do_join).open()
 
     def _do_join(self, ip: str, port: int) -> None:
+        # Straight to the lobby, on this tap. The connection is dialled on a
+        # worker thread and the lobby shows its progress -- see
+        # DinoStickApp.join_game. Waiting here for the socket is what used to
+        # freeze the UI, and the frozen frames were the ones the player spent
+        # jabbing at Ready.
         app = App.get_running_app()
+        app.ensure_screens()
         if app.join_game(ip, port):
             self.manager.current = LOBBY
 
     def _local(self) -> None:
         app = App.get_running_app()
+        app.ensure_screens()
         app.start_local()
         self.manager.current = LOBBY
 

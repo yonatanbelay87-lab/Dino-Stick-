@@ -176,22 +176,30 @@ class HostAnnouncer:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
+            # Read the socket ONCE per pass. stop() can close and clear it
+            # between the check and the send now that it no longer waits for
+            # this thread, and an `assert self._sock is not None` inside the
+            # try would raise AssertionError -- which `except OSError` does not
+            # catch, so the thread would die with a traceback on every leave.
+            sock = self._sock
+            if sock is None:
+                return
             msg = protocol.announce(self.name, self.game_port,
                                     self.player_count, C.MAX_PLAYERS)
             payload = json.dumps(msg).encode("utf-8")
             for target in self._targets:
                 try:
-                    assert self._sock is not None
-                    self._sock.sendto(payload, (target, C.PORT_DISCOVERY))
+                    sock.sendto(payload, (target, C.PORT_DISCOVERY))
                 except OSError:
                     pass  # interface down / no route -- manual IP still works
             self._stop.wait(C.DISCOVERY_INTERVAL)
 
-    def stop(self) -> None:
+    def stop(self, wait: bool = False) -> None:
+        """Stop announcing. Does not wait for the thread -- see ClientDiscovery."""
         self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-            self._thread = None
+        thread, self._thread = self._thread, None
+        if wait and thread is not None:
+            thread.join(timeout=1.0)
         if self._sock is not None:
             self._sock.close()
             self._sock = None
@@ -263,13 +271,26 @@ class ClientDiscovery:
             self._seen = {h["ip"]: h for h in fresh}
         return sorted(fresh, key=lambda h: h["name"])
 
-    def stop(self) -> None:
+    def stop(self, wait: bool = False) -> None:
+        """Shut the listener down. Does NOT wait for its thread by default.
+
+        ``wait`` used to be unconditional, and this is called from the join
+        dialog's ``on_dismiss`` -- which runs on the Kivy thread, on the tap
+        that joins a game. The listen loop sits in ``recvfrom`` with a 0.5 s
+        timeout, so joining it stalled the UI for up to a second at exactly
+        the moment the player expects the lobby to appear.
+
+        Nothing needs the wait. The thread is a daemon, it owns no state
+        anybody reads afterwards, and closing the socket underneath it makes
+        its next ``recvfrom`` raise and the loop exit. ``wait=True`` is kept
+        for app shutdown, where being tidy costs nothing.
+        """
         self._stop.set()
         if self._sock is not None:
             self._sock.close()
             self._sock = None
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-            self._thread = None
+        thread, self._thread = self._thread, None
+        if wait and thread is not None:
+            thread.join(timeout=1.0)
         self._multicast.release()
         self.multicast_locked = False

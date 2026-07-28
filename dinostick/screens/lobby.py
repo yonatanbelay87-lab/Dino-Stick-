@@ -126,6 +126,19 @@ class LobbyScreen(Screen):
 
     # -- lifecycle ----------------------------------------------------------
 
+    @staticmethod
+    def _acknowledged(app) -> bool:
+        """Has the host answered our JOIN with our own player id?
+
+        This is the whole gate on the Ready button. The id arrives in the first
+        ``lobby`` message, which the host sends on its socket thread the moment
+        it reads a JOIN -- so this flips as early as it possibly can, and the
+        button unlocks in the same frame the app's pump drains that message.
+        """
+        if app.mode != "client":
+            return True
+        return app.client is not None and app.client.player_id is not None
+
     def on_pre_enter(self, *_args) -> None:
         app = App.get_running_app()
         self._ready = False
@@ -137,7 +150,9 @@ class LobbyScreen(Screen):
             self.subtitle.text = "Waiting for players to join and get ready"
             self.address_value.text = f"{app.local_ip()}:{C.PORT_GAME}"
         elif app.mode == "client":
-            self.subtitle.text = "Connected - waiting for the host to start"
+            # The socket may still be dialling: we get here on the tap now, not
+            # on the connection. refresh() keeps this line honest.
+            self.subtitle.text = "Connecting..."
         else:
             solo = platform in ("android", "ios")
             self.subtitle.text = ("Solo run on this device" if solo else
@@ -216,8 +231,23 @@ class LobbyScreen(Screen):
 
         self._set_visible(self.ready_button, is_client,
                           theme.BUTTON_HEIGHT_COMPACT)
-        self.ready_button.text = ("READY - tap to cancel" if self._ready
-                                  else "I'M READY")
+        if is_client:
+            # Shown but locked until the host acknowledges the join, then
+            # unlocked in the same frame that acknowledgement is drained. Shown
+            # rather than hidden, because a control that appears late is a
+            # control the player has to notice; one that is visibly waiting is
+            # one they are already looking at.
+            acked = self._acknowledged(app)
+            self.ready_button.disabled = not acked
+            if not acked:
+                self.ready_button.text = "Connecting..."
+            else:
+                self.ready_button.text = ("READY - tap to cancel"
+                                          if self._ready else "I'M READY")
+            self.subtitle.text = (
+                "Connected - waiting for the host to start" if acked
+                else "Connecting to the host...")
+            self.dino_picker.disabled = not acked
 
         self._set_visible(self.start_button, not is_client,
                           theme.BUTTON_HEIGHT_COMPACT)
@@ -369,7 +399,16 @@ class LobbyScreen(Screen):
         app = App.get_running_app()
         if app.mode != "client" or app.client is None:
             return
+        # Programmatic half of the lock. The button is already disabled until
+        # the host acknowledges us, but a ready flag sent before the host has
+        # assigned an id belongs to nobody, so refuse it here as well rather
+        # than relying on the widget's state being right.
+        if not self._acknowledged(app):
+            return
         self._ready = not self._ready
+        # The UI updates from the local flag immediately and does not wait for
+        # the host to echo the roster back -- the button reflects what YOU
+        # pressed, and the badge in the roster reflects what the host knows.
         app.client.send(protocol.ready(self._ready))
         self.refresh()
 
